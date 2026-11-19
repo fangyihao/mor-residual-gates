@@ -18,29 +18,20 @@ def preprocess_config(cfg: DictConfig):
         warnings.warn("Are you sure you want to use fp16? We use bf16 by default.")
         
     # Automatically determine batch size and gradient accumulation steps
-    n_gpus = torch.cuda.device_count()
-    n_gpus = n_gpus or 1
+    # torchrun sets WORLD_SIZE across all nodes, even if each worker sees only a subset of devices.
+    world_size = int(os.environ["WORLD_SIZE"]) if "WORLD_SIZE" in os.environ else (torch.cuda.device_count() or 1)
     if cfg.get("total_batch_size") is not None:
-        print("Automatically determining batch size based on `total_batch_size`")
-        
-        # Automatically set per_device_train_batch_size or
-        # (if per_device_train_batch_size is already set) gradient_accumulation steps
         if cfg.get("gradient_accumulation_steps") is not None:
             raise ValueError("Cannot specify both total_batch_size and gradient_accumulation_steps")
-        if cfg.get("per_device_train_batch_size") is not None:
-            cfg.gradient_accumulation_steps = round(cfg.total_batch_size / (cfg.per_device_train_batch_size * n_gpus))
-            print(f"total_batch_size              : {cfg.total_batch_size} (given)")
-            print(f"torch.cuda.device_count()     : {n_gpus}")
-            print(f"per_device_train_batch_size   : {cfg.per_device_train_batch_size} (given)")
-            print(f"gradient_accumulation_steps   : {cfg.gradient_accumulation_steps} (computed)")
-            actual_total = cfg.per_device_train_batch_size * cfg.gradient_accumulation_steps * n_gpus
-            print(f"actual total batch size       : {actual_total}")
-        else:
-            cfg.per_device_train_batch_size = round(cfg.total_batch_size / n_gpus)
-            print(f"total_batch_size              : {cfg.total_batch_size} (given)")
-            print(f"torch.cuda.device_count()     : {n_gpus}")
-            print(f"per_device_train_batch_size   : {cfg.per_device_train_batch_size} (computed)")
-            print(f"actual total batch size       : {cfg.per_device_train_batch_size * n_gpus}")
+        if cfg.get("per_device_train_batch_size") is None:
+            cfg.per_device_train_batch_size = max(1, round(cfg.total_batch_size / world_size))
+        distributed_batch = cfg.per_device_train_batch_size * world_size
+        cfg.gradient_accumulation_steps = max(1, round(cfg.total_batch_size / distributed_batch))
+        actual_total = distributed_batch * cfg.gradient_accumulation_steps
+        print(f"world size: {world_size}, per-device batch: {cfg.per_device_train_batch_size}, "
+              f"gradient accumulation: {cfg.gradient_accumulation_steps}, global batch: {actual_total}")
+        if actual_total != cfg.total_batch_size:
+            warnings.warn(f"Requested total_batch_size={cfg.total_batch_size}. The effective batch size is {actual_total}.")
 
     if cfg.get("model_config") is not None:
         with open_dict(cfg):

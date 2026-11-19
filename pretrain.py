@@ -23,6 +23,7 @@ from model.util import load_model_from_config
 from model.sharing_strategy import SHARING_STRATEGY
 from model.relaxation.util import relax_weight_sharing
 from util.config import preprocess_config
+from util.device import select_npu
 from util.tokenizer import load_tokenizer_from_config 
 from util.trainer_pt import MoRTrainer, RecursiveTrainer
 from util.callback import FixedStoppingCallback, EvalCallback, PeftSaveCallback, DatasetSaveCallback, ScalingLawsSaveCallback
@@ -31,6 +32,7 @@ from util.misc import print_trainable_parameters, get_latest_checkpoint_path, pr
 
 @hydra.main(config_path="conf/pretrain", config_name="yymmdd_pretrain")
 def main(cfg: DictConfig):
+    npu_device = select_npu()
     residual = cfg.recursive.get("residual")
     if residual is not None:
         # Capture CLI overrides before preprocessing derives batch sizes and paths.
@@ -143,6 +145,7 @@ def main(cfg: DictConfig):
         run_name=cfg.wandb_run_name,
         deepspeed=ds_config,
         log_on_each_node=False,
+        **({"ddp_backend": "hccl", "optim": "adamw_torch"} if npu_device is not None else {}),
     )
     
     callbacks = []
@@ -173,7 +176,7 @@ def main(cfg: DictConfig):
     trainer.save_state()
     trainer.save_model()
     
-    if cfg.relaxation.get("enable"):
+    if cfg.relaxation.get("enable") and trainer.is_world_process_zero():
         trainer.model.base_model.model.save_pretrained(train_args.output_dir)
     
     

@@ -1,11 +1,12 @@
 from util.checkpoint import load_model_weights
 import os
+from itertools import islice
 import yaml
 import copy
 import math
 import warnings
 from pathlib import Path
-from paths import SAVE_DIR, DATA_DIR, PROJECT_ROOT, HF_CACHE_DIR; os.environ["TRANSFORMERS_CACHE"] = HF_CACHE_DIR
+from paths import SAVE_DIR, DATA_DIR, PROJECT_ROOT, HF_CACHE_DIR; os.environ.setdefault("HF_HOME", HF_CACHE_DIR)
 from typing import Callable, List, Optional, Tuple, Union, Dict # Added Dict
 from dataclasses import dataclass
 from omegaconf import DictConfig, OmegaConf
@@ -21,6 +22,7 @@ import torch.nn.functional as F
 import torch.nn.utils.rnn as rnn_utils
 import transformers
 from datasets import load_dataset, interleave_datasets
+from accelerate import PartialState
 from transformers import AutoTokenizer, AutoConfig
 from transformers.utils import ModelOutput
 from transformers.processing_utils import Unpack
@@ -33,6 +35,7 @@ from model.relaxation.util import relax_weight_sharing
 from util.tokenizer import load_tokenizer_from_config
 from util.config import preprocess_config, training_config_path
 from util.misc import get_torch_dtype, get_latest_checkpoint_path
+from util.device import select_npu
 
 # LM_DATASETS definition (same as in the original code)
 LM_DATASETS = {
@@ -102,14 +105,22 @@ def load_dataset_from_config(cfg, tokenizer):
         raise ValueError(f"Unknown dataset type: {dataset_type}")
 
 
-def evaluate_model(exp_name: str, global_sample_number: int) -> Optional[float]:
-    """
-    Evaluates a model specified by exp_name on the fineweb_test dataset.
-    Returns the average loss if successful, None otherwise.
-    """
+def evaluation_state():
+    device = select_npu()
+    if device is not None:
+        return PartialState(backend="hccl") if "LOCAL_RANK" in os.environ else PartialState()
+    return PartialState(cpu=not torch.cuda.is_available())
+
+
+def evaluate_model(exp_name: str, global_sample_number: int, state=None, attn_implementation=None) -> Optional[float]:
+    """Score the same packed sample prefix for any number of data-parallel workers."""
+    if state is None:
+        state = evaluation_state()
     print(f"Evaluating experiment: {exp_name}")
     cfg_path = training_config_path(os.path.join(SAVE_DIR, "pretrain", exp_name), "conf/pretrain")
     if not os.path.exists(cfg_path):
+        if state.num_processes > 1:
+            raise FileNotFoundError(cfg_path)
         print(f"Configuration file not found for {exp_name} at {cfg_path}. Skipping.")
         return None
 
@@ -117,6 +128,10 @@ def evaluate_model(exp_name: str, global_sample_number: int) -> Optional[float]:
     cfg = preprocess_config(cfg) # This should handle setting default max_length if not present
 
     cfg.resume_from_checkpoint = False
+    if attn_implementation is not None:
+        cfg.attn_implementation = attn_implementation
+    elif state.device.type == "npu" and cfg.get("attn_implementation", "flash_attention_2") == "flash_attention_2":
+        cfg.attn_implementation = "sdpa"
     
     model = load_model_from_config(cfg)
     
@@ -152,6 +167,8 @@ def evaluate_model(exp_name: str, global_sample_number: int) -> Optional[float]:
         load_model_weights(model, checkpoint_dir)
         print(f"Loaded experiment weights from {checkpoint_dir}")
     except (FileNotFoundError, RuntimeError) as exc:
+        if state.num_processes > 1:
+            raise
         warnings.warn(f"Skipping {exp_name}: {exc}")
         del model
         if torch.cuda.is_available():
@@ -165,58 +182,42 @@ def evaluate_model(exp_name: str, global_sample_number: int) -> Optional[float]:
     tokenizer = load_tokenizer_from_config(cfg_for_dataset)
     dataset = load_dataset_from_config(cfg_for_dataset, tokenizer)
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = state.device
     model.to(device, dtype=get_torch_dtype(cfg))
     model.eval()
-
-    total_loss = 0
+    total_loss = torch.zeros((), device=device, dtype=torch.float32)
     evaluated_samples = 0
-    avg_loss = None # Initialize avg_loss
-
-    print(f"Starting evaluation for {exp_name} on fineweb_test using device: {device}...")
-    try:
-        for i, sample in enumerate(dataset):
-            if i >= global_sample_number:
-                break
+    state.print(f"Scoring {global_sample_number} packed samples across {state.num_processes} workers.")
+    samples = islice(dataset, state.process_index, global_sample_number, state.num_processes)
+    with torch.no_grad():
+        for sample in samples:
             try:
-                input_ids = sample["input_ids"].unsqueeze(0).to(device)
-                attention_mask = sample["attention_mask"].unsqueeze(0).to(device)
-                labels = sample["labels"].unsqueeze(0).to(device)
-
-                with torch.no_grad():
-                    output = model(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        labels=labels,
-                        use_cache=True,
-                        output_attentions=False,
-                        output_hidden_states=False,
-                        return_dict=True,
-                    )
-                total_loss += output.loss.item()
+                output = model(
+                    input_ids=sample["input_ids"].unsqueeze(0).to(device),
+                    attention_mask=sample["attention_mask"].unsqueeze(0).to(device),
+                    labels=sample["labels"].unsqueeze(0).to(device),
+                    use_cache=True,
+                    output_attentions=False,
+                    output_hidden_states=False,
+                    return_dict=True,
+                )
+                total_loss += output.loss.float()
                 evaluated_samples += 1
-            except Exception as e:
-                print(f"Error processing sample {i} for {exp_name}: {e}")
-                continue
-
-        if evaluated_samples > 0:
-            avg_loss = round(total_loss / evaluated_samples, 4)
-            print(f"Experiment: {exp_name}, fineweb_test loss ({evaluated_samples} samples): {avg_loss}")
-        else:
-            print(f"Experiment: {exp_name}, No samples were evaluated successfully.")
-            avg_loss = None # Explicitly set to None if no samples evaluated
-
-    except Exception as e:
-        print(f"An error occurred during evaluation for {exp_name}: {e}")
-        avg_loss = None # Set to None on major evaluation error
-        
-    finally:
-        del model
-        del dataset
-        del tokenizer
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        return avg_loss
+            except Exception as exc:
+                if state.num_processes > 1:
+                    raise
+                warnings.warn(f"Error scoring a sample for {exp_name}: {exc}")
+    count = torch.tensor(evaluated_samples, device=device, dtype=torch.long)
+    if state.num_processes > 1:
+        torch.distributed.all_reduce(total_loss)
+        torch.distributed.all_reduce(count)
+    count = count.item()
+    if count == 0:
+        return None
+    avg_loss = round(total_loss.item() / count, 4)
+    if state.is_main_process:
+        print(f"Experiment: {exp_name}, fineweb_test loss ({count} samples): {avg_loss:.4f}")
+    return avg_loss
 
 
 def main():
@@ -241,7 +242,11 @@ def main():
         help="Path to save the JSON file with evaluation results."
     )
 
+    parser.add_argument("--attn_implementation", choices=("eager", "sdpa", "flash_attention_2"))
     args = parser.parse_args()
+    if args.sample_number < 0:
+        parser.error("--sample_number must be nonnegative")
+    state = evaluation_state()
     experiment_names = args.exp_names
     global_sample_number = args.sample_number
     output_file_path = args.output_file
@@ -256,9 +261,12 @@ def main():
     all_results: Dict[str, Optional[float]] = {} # Initialize dictionary to store all results
 
     for exp_name in experiment_names:
-        loss = evaluate_model(exp_name, global_sample_number)
+        loss = evaluate_model(exp_name, global_sample_number, state, args.attn_implementation)
         all_results[exp_name] = loss # loss can be float or None
         print("-" * 70)
+
+    if not state.is_main_process:
+        return
 
     # Save the results to a JSON file
     try:

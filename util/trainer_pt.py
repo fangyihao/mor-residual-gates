@@ -136,7 +136,9 @@ class MoRTrainer(RecursiveTrainer):
             accumulation = getattr(self, "current_gradient_accumulation_steps", self.args.gradient_accumulation_steps)
             if mor.type == "expert":
                 coeff = mor.expert.get("coeff", 0.01) if mor.expert.sampling == "aux_loss" else 1.0
-                loss = loss + coeff * outputs.sampling_loss * world
+                # Expert BCE is already a local mean. DDP averages workers and the
+                # Trainer accumulates the microbatches for this optimizer update.
+                loss = loss + coeff * outputs.sampling_loss / accumulation
                 stages = self.cfg.recursive.num_recursion - int(not mor.expert.get("include_first", True))
                 self.record("sampling_loss", outputs.sampling_loss / max(stages, 1))
                 self.record("sampling_acc", outputs.sampling_acc)

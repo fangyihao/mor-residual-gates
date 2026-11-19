@@ -1,34 +1,5 @@
-# packages for training
-torch>=2.6
-hydra-core
-omegaconf
-wandb
-tensorboard
-transformers==5.23.0
-datasets
-accelerate>=1.16
+-r requirements-base.txt
+
+# Additional packages for the GPU launchers and quantization
 deepspeed
-peft>=0.22
-zstandard
-boto3
-smart_open
 bitsandbytes
-
-# Optional for attn_implementation=flash_attention_2, after installing torch
-# pip install flash-attn --no-build-isolation
-
-
-# packages for evaluation
-sacrebleu
-evaluate
-sqlitedict
-nltk
-pytablewriter
-rouge_score
-matplotlib
-more_itertools
-
-# LM-evaluation-harness
-# git clone --depth 1 https://github.com/EleutherAI/lm-evaluation-harness
-# cd lm-evaluation-harness
-# pip install -e .

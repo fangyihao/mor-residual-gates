@@ -10,14 +10,15 @@ def svd_init_lora_weights(cfg, peft_model, lora_init_dict, rank_pattern):
     torch_dtype = get_torch_dtype(cfg)
     
     lora_A_updates, lora_B_updates = {}, {}
+    svd_device = "cuda" if torch.cuda.is_available() else "cpu"
     
     for key, init_weight in lora_init_dict.items():
         layer_idx, layer_name = key.split("_", 1)
         
         with torch.no_grad():
-            u, s, v = torch.linalg.svd(init_weight.float().cuda(), full_matrices=False)
+            u, s, v = torch.linalg.svd(init_weight.to(device=svd_device, dtype=torch.float32), full_matrices=False)
             
-            pattern = key.replace("_", "\..*\.", 1)
+            pattern = key.replace("_", r"\..*\.", 1)
             found = False
             for target_key, value in rank_pattern.items():
                 if re.search(pattern, target_key):

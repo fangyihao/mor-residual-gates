@@ -73,6 +73,29 @@ model = MoRLlamaForCausalLM.from_pretrained(
 Run the CPU regression suite with `python -m pytest -q tests/test_recursive_residual.py`. It uses tiny local Llama checkpoints to test pretrained preservation, sparse routing, signed gates, fixed coefficients, checkpoint restoration, and optimizer grouping.
 
 
+### Ascend NPU training and FineWeb evaluation
+
+Use an Ascend environment with the driver and CANN runtime active. Install a matching PyTorch (2.6 or newer) and `torch_npu` pair for your hardware and Python version, then install the shared project dependencies. See the [Ascend compatibility table](https://github.com/Ascend/pytorch/blob/master/COMPATIBILITY.en.md).
+
+```bash
+python -m pip install -r requirements-base.txt
+bash scripts/run_npu.sh check 0,1,2,3,4,5,6,7
+bash scripts/run_npu.sh train 0,1,2,3,4,5,6,7 name=ascend_rezero
+bash scripts/run_npu.sh eval 0,1,2,3,4,5,6,7 --exp_names ascend_rezero --sample_number 200
+```
+
+The device list selects visible Ascend device IDs on the current host. List them in ascending order. The launcher binds one worker to each selected device. The `check` command verifies an HCCL all-reduce across every rank before you load a model. Training uses replicated data parallelism, ordinary PyTorch AdamW, and SDPA by default. Pass `attn_implementation=eager` to training or `--attn_implementation eager` to evaluation to select eager attention. All four residual modes use this launcher. For example, append `recursive.residual.mode=power name=ascend_power` to the training command.
+
+The default global batch of 1,024 sequences on eight NPUs uses 16 sequences per NPU and eight accumulation steps. The launcher uses the total number of workers across hosts when deriving accumulation. Expert-router BCE is averaged across workers and accumulated microbatches, so its coefficient has the same scale when splitting a batch. FineWeb evaluation distributes the requested packed samples across workers, aggregates their losses, and writes one results file from rank zero.
+
+For two eight-NPU hosts, run the following on **each host**. Set `NODE_RANK=0` on the first and `NODE_RANK=1` on the second. Use the same reachable address and port for rank zero, model and data paths on each host, and a shared `results/` directory for checkpointing and resume.
+
+```bash
+export NNODES=2 MASTER_ADDR=host0.example.org MASTER_PORT=29500
+export NODE_RANK=0  # use 1 on the second host
+bash scripts/run_npu.sh train 0,1,2,3,4,5,6,7 name=ascend_rezero_16npu
+```
+
 ## 🔥 Research Motivation
 
 **Early-exiting [[CALM](https://arxiv.org/abs/2207.07061)]**, an Adaptive Computation technique, helps LLMs run more efficiently by allowing them to skip unnecessary computations when they're confident in their predictions. This creates dynamic pathways through the model. However, putting early-exiting into practice faces **two main bottlenecks**:

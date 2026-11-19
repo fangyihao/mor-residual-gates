@@ -143,6 +143,8 @@ def get_iterator(param_dict):
         
 
 def get_launcher_type():
+    if os.environ.get("MOR_DEVICE") == "npu":
+        return "torchrun"
     is_accelerate_launch = any(var.startswith('ACCELERATE_') for var in os.environ)
     if is_accelerate_launch:
         return "accelerate"

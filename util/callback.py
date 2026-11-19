@@ -102,7 +102,7 @@ class EvalCallback(TrainerCallback):
         if eval_cfg.get("device") is None:
             OmegaConf.set_struct(eval_cfg, True)
             with open_dict(eval_cfg):
-                eval_cfg.device = "cuda:0" if torch.cuda.is_available() else "cpu"
+                eval_cfg.device = str(args.device)
             warnings.warn(f"If you want to specify the device, use eval_cfg.device")
         if eval_cfg.get("batch_size") is None:
             OmegaConf.set_struct(eval_cfg, True)
@@ -165,6 +165,8 @@ class PeftSaveCallback(TrainerCallback):
             self.fixed_save_steps = [int(step) for step in fixed_save_steps.split(",")]
         
     def on_save(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+        if not state.is_world_process_zero:
+            return
         if (state.global_step % self.save_steps == 0 or state.global_step in self.fixed_save_steps) and state.global_step != 0:
             checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{state.global_step}"
             output_dir = os.path.join(args.output_dir, checkpoint_folder)
@@ -181,6 +183,8 @@ class DatasetSaveCallback(TrainerCallback):
             self.fixed_save_steps = [int(step) for step in fixed_save_steps.split(",")]
         
     def on_save(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+        if not state.is_world_process_zero:
+            return
         if (state.global_step % self.save_steps == 0 or state.global_step in self.fixed_save_steps) and state.global_step != 0:
             checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{state.global_step}"
             output_dir = os.path.join(args.output_dir, checkpoint_folder)
