@@ -2,9 +2,10 @@ from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
-from transformers.processing_utils import Unpack
+from typing_extensions import Unpack
+from transformers.utils import TransformersKwargs
 
-from model.recursive_model.modeling_llama import Cache, FlashAttentionKwargs
+from model.recursive_model.modeling_llama import Cache
 
 
 class EncodedLlamaDecoderLayer(nn.Module):
@@ -25,7 +26,7 @@ class EncodedLlamaDecoderLayer(nn.Module):
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        **kwargs: Unpack[FlashAttentionKwargs]):
+        **kwargs: Unpack[TransformersKwargs]):
     
         outputs = self.block(
                 hidden_states=hidden_states, 

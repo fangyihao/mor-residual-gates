@@ -1,7 +1,7 @@
 import torch.nn as nn
 from peft import get_peft_model
 from peft import PeftType
-from peft.peft_model import PEFT_TYPE_TO_MODEL_MAPPING
+from peft.mapping import PEFT_TYPE_TO_TUNER_MAPPING
 
 from model.relaxation.lora.config import get_lora_config
 from model.relaxation.lora.svd_init import svd_init_lora_weights
@@ -9,7 +9,7 @@ from model.relaxation.prompt.config import AdaptionPromptConfig
 from model.relaxation.prompt.model import AdaptionPromptModel_
 from model.relaxation.recursion_encoding.layer import EncodedLlamaDecoderLayer
 
-PEFT_TYPE_TO_MODEL_MAPPING[PeftType.ADAPTION_PROMPT] = AdaptionPromptModel_
+PEFT_TYPE_TO_TUNER_MAPPING[PeftType.ADAPTION_PROMPT] = AdaptionPromptModel_
 
 
 def relax_weight_sharing(cfg, model, lora_init_dict=None):

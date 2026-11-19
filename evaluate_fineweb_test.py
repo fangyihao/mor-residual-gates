@@ -1,3 +1,4 @@
+from util.checkpoint import load_model_weights
 import os
 import yaml
 import copy
@@ -135,33 +136,7 @@ def evaluate_model(exp_name: str, global_sample_number: int) -> Optional[float]:
         if cfg.get("resume_from_checkpoint"): # Check if resume_from_checkpoint is True
             latest_checkpoint_path_obj = get_latest_checkpoint_path(cfg, resume_step=cfg.resume_step if ("resume_step" in cfg and cfg.resume_step is not None) else None)
             if latest_checkpoint_path_obj:
-                latest_checkpoint = str(latest_checkpoint_path_obj)
-                pytorch_model_path_relax = os.path.join(latest_checkpoint, "pytorch_model.bin")
-                safetensors_model_path_relax = os.path.join(latest_checkpoint, "model.safetensors")
-
-                loaded_relaxation_checkpoint = False
-                if os.path.exists(pytorch_model_path_relax):
-                    try:
-                        state_dict = torch.load(pytorch_model_path_relax, map_location='cpu')
-                        model.get_base_model().load_state_dict(state_dict)
-                        loaded_relaxation_checkpoint = True
-                        print(f"Loaded relaxation checkpoint from {pytorch_model_path_relax}")
-                    except Exception as e:
-                        print(f"Error loading relaxation pytorch_model.bin: {e}")
-                elif os.path.exists(safetensors_model_path_relax):
-                    try:
-                        from safetensors.torch import load_file
-                        state_dict = load_file(safetensors_model_path_relax, device='cpu')
-                        model.get_base_model().load_state_dict(state_dict)
-                        loaded_relaxation_checkpoint = True
-                        print(f"Loaded relaxation checkpoint from {safetensors_model_path_relax}")
-                    except Exception as e:
-                        print(f"Error loading relaxation model.safetensors: {e}")
-
-                if not loaded_relaxation_checkpoint:
-                     print(f"Specified resume_from_checkpoint for relaxation, but checkpoint not found at {latest_checkpoint}. Model will use initial weights for relaxation stage if not overridden by main exp checkpoint.")
-            else:
-                print(f"Specified resume_from_checkpoint for relaxation, but get_latest_checkpoint_path returned None.")
+                load_model_weights(model.get_base_model(), latest_checkpoint_path_obj)
 
     if "mor" in cfg and cfg.mor.get("enable"):
         if cfg.mor.type == "expert":
@@ -173,34 +148,11 @@ def evaluate_model(exp_name: str, global_sample_number: int) -> Optional[float]:
 
     # Define checkpoint paths for the main experiment
     checkpoint_dir = os.path.join(SAVE_DIR, "pretrain", exp_name)
-    pytorch_model_path = os.path.join(checkpoint_dir, "pytorch_model.bin")
-    safetensors_model_path = os.path.join(checkpoint_dir, "model.safetensors")
-
-    main_checkpoint_loaded = False
-    if os.path.exists(pytorch_model_path):
-        try:
-            state_dict = torch.load(pytorch_model_path, map_location='cpu') # Load to CPU first to save GPU memory
-            model.load_state_dict(state_dict)
-            main_checkpoint_loaded = True
-            print(f"Successfully loaded main experiment checkpoint from {pytorch_model_path}")
-        except Exception as e:
-            print(f"Error loading main experiment pytorch_model.bin for {exp_name}: {e}")
-            # If checkpoint loading fails, we might not want to proceed with this model.
-            # Depending on desired behavior, could return None here.
-    elif os.path.exists(safetensors_model_path):
-        try:
-            from safetensors.torch import load_file
-            state_dict = load_file(safetensors_model_path, device='cpu') # Load to CPU first
-            model.load_state_dict(state_dict)
-            main_checkpoint_loaded = True
-            print(f"Successfully loaded main experiment checkpoint from {safetensors_model_path}")
-        except Exception as e:
-            print(f"Error loading main experiment model.safetensors for {exp_name}: {e}")
-            # Similarly, could return None here.
-
-    if not main_checkpoint_loaded:
-        warnings.warn(f"No main checkpoint found or loaded for {exp_name} at {checkpoint_dir}. Evaluation might use base/relaxation weights or be inaccurate. Skipping further evaluation for this experiment.")
-        # Clean up before returning if model was partially initialized
+    try:
+        load_model_weights(model, checkpoint_dir)
+        print(f"Loaded experiment weights from {checkpoint_dir}")
+    except (FileNotFoundError, RuntimeError) as exc:
+        warnings.warn(f"Skipping {exp_name}: {exc}")
         del model
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

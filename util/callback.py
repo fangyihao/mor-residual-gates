@@ -1,7 +1,6 @@
 import os 
 import sys
 import json
-import pickle
 import warnings 
 import subprocess
 from collections import defaultdict 
@@ -17,7 +16,6 @@ import lm_eval
 from lm_eval import evaluator, utils
 from lm_eval.tasks import TaskManager
 from lm_eval.utils import make_table
-from transformers.trainer_callback import CallbackHandler
 
 
 class FixedStoppingCallback(TrainerCallback):
@@ -171,7 +169,7 @@ class PeftSaveCallback(TrainerCallback):
             checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{state.global_step}"
             output_dir = os.path.join(args.output_dir, checkpoint_folder)
             
-            kwargs["model"].base_model.model.save_pretrained(output_dir, safe_serialization=False)
+            kwargs["model"].base_model.model.save_pretrained(output_dir)
             
             
 class DatasetSaveCallback(TrainerCallback):
@@ -190,56 +188,6 @@ class DatasetSaveCallback(TrainerCallback):
             dataset = kwargs["train_dataloader"].dataset
             state_dict = dataset.state_dict()
             torch.save(state_dict, os.path.join(output_dir, "dataset.pt"))
-
-
-class MorSaveCallback(TrainerCallback):
-    def __init__(self, save_steps: int, fixed_save_steps: str = None):
-        super().__init__()
-        self.save_steps = save_steps
-        self.fixed_save_steps = []
-        if fixed_save_steps is not None:
-            self.fixed_save_steps = [int(step) for step in fixed_save_steps.split(",")]  # list
-        
-    def on_save(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
-        if (state.global_step % self.save_steps == 0 or state.global_step in self.fixed_save_steps) and state.global_step != 0:
-            checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{state.global_step}"
-            output_dir = os.path.join(args.output_dir, checkpoint_folder)
-            
-            training_step = None
-            for layer_idx in range(len(kwargs['model'].model.layers)):
-                if hasattr(kwargs['model'].model.layers[layer_idx], "training_step"):
-                    training_step = kwargs['model'].model.layers[layer_idx].training_step
-                    break
-            if training_step is not None:
-                with open(os.path.join(output_dir, "training_step.pickle"), 'wb') as f:
-                    pickle.dump(training_step, f)
-            
-            if "sam_optimizer" in kwargs and kwargs["sam_optimizer"] is not None:
-                torch.save(kwargs["sam_optimizer"].state_dict(), os.path.join(output_dir, "sam_optimizer.pt"))
-            if "sam_lr_scheduler" in kwargs and kwargs["sam_lr_scheduler"] is not None:
-                torch.save(kwargs["sam_lr_scheduler"].state_dict(), os.path.join(output_dir, "sam_lr_scheduler.pt"))
-                    
-                
-class MoRCallbackHandler(CallbackHandler):
-    def __init__(self, callbacks, model, processing_class, optimizer, lr_scheduler, sam_optimizer=None, sam_lr_scheduler=None,):
-        self.callbacks = []
-        for cb in callbacks:
-            self.add_callback(cb)
-        self.model = model
-        self.processing_class = processing_class
-        self.optimizer = optimizer
-        self.lr_scheduler = lr_scheduler
-        self.train_dataloader = None
-        self.eval_dataloader = None
-        
-        self.sam_optimizer = sam_optimizer
-        self.sam_lr_scheduler = sam_lr_scheduler
-        
-    def on_save(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
-        control.should_save = False
-        kwargs["sam_optimizer"] = self.sam_optimizer
-        kwargs["sam_lr_scheduler"] = self.sam_lr_scheduler
-        return self.call_event("on_save", args, state, control, **kwargs)
 
 
 class ScalingLawsSaveCallback(TrainerCallback):

@@ -5,76 +5,14 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers.processing_utils import Unpack
-from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
-from transformers.utils import logging
+from transformers.utils import TransformersKwargs
+from typing_extensions import Unpack
 
-from model.kv_caches.cache_utils import Cache, StaticCache, DynamicCache
+from model.kv_caches.cache_utils import Cache, RoutedDynamicCache
 from model.mor_model.util import ROUTER_TYPES, MoRLayerOutputWithPast, run_decoder_block
-from model.base_model.modeling_llama import apply_rotary_pos_emb, eager_attention_forward, LlamaAttention
 from util.misc import get_torch_dtype
 
-logger = logging.get_logger(__name__)
 
-
-class MoRLlamaAttention(LlamaAttention):
-    """Multi-headed attention from 'Attention Is All You Need' paper"""
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
-        attention_mask: Optional[torch.Tensor],
-        past_key_value: Optional[Cache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        **kwargs: Unpack[FlashAttentionKwargs],
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        input_shape = hidden_states.shape[:-1]
-        hidden_shape = (*input_shape, -1, self.head_dim)
-        
-        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)            
-        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-
-        cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-
-        if past_key_value is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            # This class is for hybrid KV sharing that leverages shared caches 
-            # for inactive positions while updating active ones through actual computation
-            if "selected_tokens" in kwargs:
-                cache_kwargs["selected_tokens"] = kwargs["selected_tokens"]
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-
-        attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
-            if self.config._attn_implementation == "sdpa" and kwargs.get("output_attentions", False):
-                logger.warning_once(
-                    "`torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to "
-                    'eager attention. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
-                )
-            else:
-                attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
-
-        attn_output, attn_weights = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            **kwargs,
-        )
-
-        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-        attn_output = self.o_proj(attn_output)
-        return attn_output, attn_weights
-    
-    
 class MoRLlamaDecoderLayer(nn.Module):
     """The Mixtures of Depth Block that dynamically which tokens to process in a block.
     Wraps around decoder block to allow for token dropping.
@@ -92,14 +30,6 @@ class MoRLlamaDecoderLayer(nn.Module):
         self.capacity_factor = capacity_factor
         self.cap_warmup_step = cap_warmup_step  # warm_up step for capacity_factor
         
-        torch_dtype = get_torch_dtype(cfg)
-        for blk in self.block:
-            attn = MoRLlamaAttention(config, blk.self_attn.layer_idx).to(torch_dtype)
-            # Reuse the projections to preserve their weights and parameter sharing.
-            for name in ("q_proj", "k_proj", "v_proj", "o_proj"):
-                setattr(attn, name, getattr(blk.self_attn, name))
-            blk.self_attn = attn
-
         self.training_step = 0
         
         self.router_func = cfg.mor.expert.router_func
@@ -136,7 +66,8 @@ class MoRLlamaDecoderLayer(nn.Module):
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         prev_selected_tokens: Optional[torch.LongTensor] = None,
         checkpoint_block=None,
-        **kwargs: Unpack[FlashAttentionKwargs]
+        cache_prefix=0,
+        **kwargs: Unpack[TransformersKwargs]
     ):          
         total_x = x
         bs, seq_len, hidden_dim = total_x.shape
@@ -255,8 +186,13 @@ class MoRLlamaDecoderLayer(nn.Module):
             top_k_tokens_processed = torch.gather(top_k_tokens, dim=1, index=indices_expanded)
             
         else:
-            if attention_mask is not None: 
+            if isinstance(past_key_value, RoutedDynamicCache) and not (getattr(self, "first_stage", False) and self.capacity_factor == 1):
+                kwargs["cache_routing"] = (torch.arange(bs, device=x.device), selected_tokens.squeeze(-1),
+                                           bs, seq_len, cache_prefix, attention_mask)
+                attention_mask = None
+            if attention_mask is not None and not (getattr(self, "first_stage", False) and top_k == seq_len):
                 if attention_mask.dim() == 4: 
+                    attention_mask = attention_mask.expand(bs, -1, -1, -1)
                     row_indices = selected_tokens.unsqueeze(1).expand(bs, 1, top_k, attention_mask.shape[-1])  
                     mask_rows_selected = torch.gather(attention_mask, 2, row_indices)
                     col_indices = selected_tokens.unsqueeze(1).transpose(2, 3).expand(bs, 1, top_k, top_k)

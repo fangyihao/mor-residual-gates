@@ -58,7 +58,7 @@ def load_model_from_config(cfg: DictConfig):
         return model_cls.from_pretrained(
             cfg.model_name_or_path,
             attn_implementation=attn_implementation, 
-            torch_dtype=torch_dtype,
+            dtype=torch_dtype,
             local_files_only=local_files_only,
         )
                 
@@ -67,7 +67,7 @@ def load_model_from_config(cfg: DictConfig):
         config = AutoConfig.from_pretrained(
             cfg.model_name_or_path,
             attn_implementation=attn_implementation, 
-            torch_dtype=torch_dtype,
+            dtype=torch_dtype,
             local_files_only=local_files_only,
         )
         
@@ -82,4 +82,4 @@ def load_model_from_config(cfg: DictConfig):
             warnings.warn(f"original max_position_embeddings of {config.max_position_embeddings} is changed to {cfg.max_length}")
             setattr(config, "max_position_embeddings", cfg.max_length)
         return model_cls._from_config(
-            config, attn_implementation=attn_implementation, torch_dtype=torch_dtype,)
+            config, attn_implementation=attn_implementation, dtype=torch_dtype,)

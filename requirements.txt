@@ -1,21 +1,20 @@
 # packages for training
-torch
+torch>=2.6
 hydra-core
 omegaconf
 wandb
 tensorboard
-transformers==4.52.4
+transformers==5.23.0
 datasets
-accelerate
+accelerate>=1.16
 deepspeed
-peft
+peft>=0.22
 zstandard
 boto3
 smart_open
 bitsandbytes
-flash-attn
 
-# FlashAttention
+# Optional for attn_implementation=flash_attention_2, after installing torch
 # pip install flash-attn --no-build-isolation
 
 

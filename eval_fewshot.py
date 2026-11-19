@@ -1,3 +1,4 @@
+from util.checkpoint import load_model_weights
 import os
 os.environ["HYDRA_FULL_ERROR"] = "1"
 from paths import PROJECT_ROOT, SAVE_DIR, HF_CACHE_DIR; os.environ["HF_HOME"] = HF_CACHE_DIR
@@ -19,7 +20,7 @@ import torch
 import torch.distributed as dist
 from omegaconf import DictConfig
 from omegaconf import OmegaConf, open_dict
-from safetensors import safe_open
+from safetensors.torch import load_file
 from torch.utils.tensorboard import SummaryWriter
 from accelerate import Accelerator
 from transformers import AutoConfig
@@ -152,26 +153,20 @@ def evaluate_model(cfg: DictConfig, eval_logger=None, writer=None, step=None):
                 model = model_cls.from_pretrained(
                     cfg.model_args.split("=")[1],
                     attn_implementation=attn_implementation, 
-                    torch_dtype=torch_dtype,
+                    dtype=torch_dtype,
                 )
                 
                 if cfg.relaxation.method == "recursion_encoding":
                     from model.relaxation.util import relax_weight_sharing
                     model = relax_weight_sharing(cfg, model)
                 
-                try:
-                    state_dict = torch.load(os.path.join(cfg.model_args.split("=")[1], "pytorch_model.bin"))
-                except FileNotFoundError:
-                    from safetensors.torch import load_file
-                    state_dict = load_file(os.path.join(cfg.model_args.split("=")[1], "model.safetensors"))
-                    
-                model.load_state_dict(state_dict)
+                load_model_weights(model, cfg.model_args.split("=", 1)[1])
                 
             elif cfg.relaxation.method == "adaption_prompt":
                 model = model_cls.from_pretrained(
                     OmegaConf.load(train_cfg_path).model_name_or_path,
                     attn_implementation=attn_implementation,
-                    torch_dtype=torch_dtype,
+                    dtype=torch_dtype,
                 )
                 
                 from model.sharing_strategy import SHARING_STRATEGY
@@ -180,11 +175,14 @@ def evaluate_model(cfg: DictConfig, eval_logger=None, writer=None, step=None):
                 from model.relaxation.util import relax_weight_sharing
                 model = relax_weight_sharing(cfg, model)
                 
-                state_dict = torch.load(os.path.join(cfg.model_args.split("=")[1], "pytorch_model.bin"))
                 if cfg.relaxation.method == "adaption_prompt":
-                    model.get_base_model().load_state_dict(state_dict)
+                    load_model_weights(model.get_base_model(), cfg.model_args.split("=", 1)[1])
                     
-                    adapter_state_dict = torch.load(os.path.join(cfg.model_args.split("=")[1], "adapter_model.bin"))
+                    directory = Path(cfg.model_args.split("=", 1)[1])
+                    if (directory / "adapter_model.safetensors").is_file():
+                        adapter_state_dict = load_file(str(directory / "adapter_model.safetensors"))
+                    else:
+                        adapter_state_dict = torch.load(directory / "adapter_model.bin", map_location="cpu", weights_only=True)
                     
                     if "prompt_embeddings" in adapter_state_dict:
                         adapter_state_dict["prompt_encoder.default.embedding.weight"] = adapter_state_dict["prompt_embeddings"]
@@ -193,11 +191,15 @@ def evaluate_model(cfg: DictConfig, eval_logger=None, writer=None, step=None):
                     model.load_state_dict(adapter_state_dict, strict=False)
             
         else:
-            if "mor" in cfg and cfg.mor.get("enable"):
+            directory = cfg.model_args.split("=", 1)[1]
+            saved_config = AutoConfig.from_pretrained(directory)
+            if getattr(saved_config, "mor_routing", None):
+                model = model_cls.from_pretrained(directory, dtype=torch_dtype, attn_implementation=attn_implementation)
+            elif "mor" in cfg and cfg.mor.get("enable"):
                 config = AutoConfig.from_pretrained(
                         OmegaConf.load(train_cfg_path).model_name_or_path,
                         attn_implementation=attn_implementation, 
-                        torch_dtype=torch_dtype,
+                        dtype=torch_dtype,
                     )
                                 
                 if cfg.get("model_config") is not None:
@@ -208,24 +210,25 @@ def evaluate_model(cfg: DictConfig, eval_logger=None, writer=None, step=None):
                         print(f" {k}: {v}")
                         setattr(config, k, v)
                 model = model_cls._from_config(
-                    config, attn_implementation=attn_implementation, torch_dtype=torch_dtype,)
+                    config, attn_implementation=attn_implementation, dtype=torch_dtype,)
                 if cfg.recursive.get("residual") is not None:
                     from model.sharing_strategy import SHARING_STRATEGY
                     model, _ = SHARING_STRATEGY[cfg.model_arch](cfg, model)
                         
+                if cfg.get("kv_sharing", {}).get("enable"):
+                    model.set_kv_sharing_config(cfg)
                 if cfg.mor.type == "expert":
                     model.transform_layer_to_mor_expert(cfg)
                 elif cfg.mor.type == "token":
                     model.transform_layer_to_mor_token(cfg)
                 
-                state_dict = torch.load(os.path.join(cfg.model_args.split("=")[1], "pytorch_model.bin"), map_location="cpu")
-                model.load_state_dict(state_dict)
+                load_model_weights(model, cfg.model_args.split("=", 1)[1])
                 
             else:                       
                 model = model_cls.from_pretrained(
                     cfg.model_args.split("=")[1],
                     attn_implementation=attn_implementation, 
-                    torch_dtype=torch_dtype,
+                    dtype=torch_dtype,
                 )
         
         if "kv_sharing" in cfg and cfg.kv_sharing.get("enable"):

@@ -6,10 +6,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.utils.rnn as rnn_utils
-from transformers.processing_utils import Unpack
-from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
+from typing_extensions import Unpack
+from transformers.utils import TransformersKwargs
 
-from model.kv_caches.cache_utils import Cache, StaticCache, DynamicCache
+from model.kv_caches.cache_utils import Cache, RoutedDynamicCache
 from model.mor_model.util import ROUTER_TYPES, MoRLayerOutputWithPast, run_decoder_block
 from util.misc import get_torch_dtype
 
@@ -109,11 +109,12 @@ class MoRLlamaDecoderLayer(nn.Module):
             
         if attention_mask is not None: 
             if attention_mask.dim() == 4:
-                new_attention_mask = torch.ones(
+                new_attention_mask = torch.full(
                     (new_bs, 1, new_seq_len, new_seq_len),
+                    False if attention_mask.dtype == torch.bool else torch.finfo(attention_mask.dtype).min,
                     dtype=attention_mask.dtype,
                     device=attention_mask.device,
-                ) * torch.finfo(attention_mask.dtype).min
+                )
                 
                 for b in range(new_bs):
                     indices = selected_seq_indices[b]
@@ -180,7 +181,8 @@ class MoRLlamaDecoderLayer(nn.Module):
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         prev_selected_tokens: Optional[torch.LongTensor] = None,
         checkpoint_block=None,
-        **kwargs: Unpack[FlashAttentionKwargs]
+        cache_prefix=0,
+        **kwargs: Unpack[TransformersKwargs]
     ):
         bs, seq_len, hidden_dim =  x.shape
                 
@@ -217,7 +219,8 @@ class MoRLlamaDecoderLayer(nn.Module):
         share_kv = self.cfg.get("kv_sharing", {}).get("enable", False)
         for index, block in enumerate(self.block_list): 
                         
-            if share_kv:
+            full_stage = share_kv or (index == 0 and isinstance(past_key_value, RoutedDynamicCache))
+            if full_stage:
                 batched_x = x.clone()
                 active = (top_expert_indices >= index).unsqueeze(-1) if self.residual_recursion else None
                 new_attention_mask = attention_mask
@@ -240,7 +243,11 @@ class MoRLlamaDecoderLayer(nn.Module):
                 
                 if batched_x is None:
                     continue
-            
+                if isinstance(past_key_value, RoutedDynamicCache):
+                    rows = torch.tensor(selected_batch_indices, device=x.device)
+                    positions = rnn_utils.pad_sequence(selected_seq_indices, batch_first=True, padding_value=-1)
+                    kwargs["cache_routing"] = (rows, positions, bs, seq_len, cache_prefix, attention_mask)
+
             for blk in block: 
                 outputs = run_decoder_block(
                     blk, batched_x, checkpoint_block,
@@ -253,12 +260,12 @@ class MoRLlamaDecoderLayer(nn.Module):
                     position_embeddings=new_position_embeddings,
                     **kwargs
                 )
-                if self.residual_recursion and share_kv:
+                if self.residual_recursion and full_stage:
                     batched_x = torch.where(active, outputs[0], batched_x)
                 else:
                     batched_x = outputs[0]
                 
-            if share_kv:
+            if full_stage:
                 batched_x_processed, _, _, _, _, selected_batch_indices, selected_seq_indices = \
                     self.select_tokens_and_batch_with_padding(
                             batched_x,

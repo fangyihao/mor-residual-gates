@@ -1,47 +1,20 @@
 from dataclasses import dataclass
-from typing import Callable, List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
-import torch.utils.checkpoint
 from torch import nn
-
-from transformers.activations import ACT2FN
-from transformers.generation import GenerationMixin
-from transformers.modeling_attn_mask_utils import AttentionMaskConverter
-from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
-from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
-from transformers.processing_utils import Unpack
-from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
-from transformers.utils import (
-    LossKwargs,
-    ModelOutput,
-    add_code_sample_docstrings,
-    add_start_docstrings,
-    add_start_docstrings_to_model_forward,
-    logging,
-    replace_return_docstrings,
-)
+from omegaconf import OmegaConf
 from transformers import LlamaConfig
-from transformers.utils.deprecation import deprecate_kwarg
+from transformers.cache_utils import Cache
+from transformers.masking_utils import create_causal_mask
+from transformers.utils import ModelOutput, TransformersKwargs, logging
+from typing_extensions import Unpack
 
+from model.kv_caches.cache_utils import prepare_cache
+from model.recursive_model.modeling_llama import LlamaModel, LlamaForCausalLM
 from model.recursive_residual import configure_residual_layers
-from model.kv_caches.cache_utils import Cache, StaticCache, DynamicCache, RecursiveDynamicCache
-from model.base_model.modeling_llama import (
-    LlamaModel, 
-    LlamaForCausalLM, 
-    KwargsForCausalLM,
-    LlamaRMSNorm,
-    LLAMA_START_DOCSTRING,
-    LLAMA_INPUTS_DOCSTRING,
-)
 
 logger = logging.get_logger(__name__)
-
-_CHECKPOINT_FOR_DOC = "meta-llama/Llama-2-7b-hf"
-_CONFIG_FOR_DOC = "LlamaConfig"
-
-ALL_LAYERNORM_LAYERS.append(LlamaRMSNorm)
 
 
 @dataclass
@@ -135,10 +108,6 @@ class MoRCausalLMOutputWithPast(ModelOutput):
     router_z_loss: Optional[torch.FloatTensor] = None
     
     
-@add_start_docstrings(
-    "The bare LLaMA Model outputting raw hidden-states without any specific head on top.",
-    LLAMA_START_DOCSTRING,
-)
 class MoRLlamaModel(LlamaModel):
     """
     Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`LlamaDecoderLayer`]
@@ -147,7 +116,6 @@ class MoRLlamaModel(LlamaModel):
         config: LlamaConfig
     """
 
-    @add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -160,14 +128,14 @@ class MoRLlamaModel(LlamaModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
+        **flash_attn_kwargs: Unpack[TransformersKwargs],
     ) -> Union[Tuple, MoRBaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         use_cache = use_cache if use_cache is not None else self.config.use_cache
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        return_dict = return_dict if return_dict is not None else self.config.return_dict
 
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
@@ -181,15 +149,11 @@ class MoRLlamaModel(LlamaModel):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
-        if use_cache and past_key_values is None:
-            if "kv_sharing" in self.config and self.config.kv_sharing is not None:
-                kwargs = self.config.kv_sharing
-                past_key_values = RecursiveDynamicCache(kwargs["base_depth"], kwargs["num_recursion"], kwargs["sharing"], kwargs["update_cache"])
-            else:
-                past_key_values = DynamicCache()
+        if use_cache:
+            past_key_values = prepare_cache(self.config, past_key_values, routed=True)
 
+        past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
         if cache_position is None:
-            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
             cache_position = torch.arange(
                 past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
             )
@@ -197,8 +161,9 @@ class MoRLlamaModel(LlamaModel):
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        causal_mask = self._update_causal_mask(
-            attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
+        causal_mask = create_causal_mask(
+            config=self.config, inputs_embeds=inputs_embeds, attention_mask=attention_mask,
+            past_key_values=past_key_values, position_ids=position_ids,
         )
 
         hidden_states = inputs_embeds
@@ -252,6 +217,7 @@ class MoRLlamaModel(LlamaModel):
                         position_embeddings=position_embeddings,
                         prev_selected_tokens=None if getattr(decoder_layer, "first_stage", False) else prev_selected_tokens,
                         checkpoint_block=self._gradient_checkpointing_func if checkpoint_blocks else None,
+                        cache_prefix=past_seen_tokens,
                         **flash_attn_kwargs,
                     )
                     if decoder_layer.mor_type == "expert":
@@ -324,15 +290,19 @@ class MoRLlamaModel(LlamaModel):
 
 class MoRLlamaForCausalLM(LlamaForCausalLM):
     
+    backbone_class = MoRLlamaModel
+
     def __init__(self, config):
         super().__init__(config)
-        self.model = MoRLlamaModel(config)
-        self.vocab_size = config.vocab_size
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        routing = getattr(config, "mor_routing", None)
+        if routing is not None:
+            cfg = OmegaConf.create(routing)
+            if cfg.mor.type == "expert":
+                self.transform_layer_to_mor_expert(cfg)
+            else:
+                self.transform_layer_to_mor_token(cfg)
+            self.post_init()
 
-        # Initialize weights and apply final processing
-        self.post_init()
-    
     def _wrap_recursions(self, cfg, wrap_group):
         configure_residual_layers(self, cfg.recursive)
         layers = self.model.layers
@@ -353,6 +323,9 @@ class MoRLlamaForCausalLM(LlamaForCausalLM):
             wrapped = [layers[0], *wrapped, layers[-1]]
         self.model.layers = nn.ModuleList(wrapped)
         self.model.num_routing_groups = len(groups)
+        # Save only the architecture needed by from_pretrained, omitting run paths and data settings.
+        keys = ["mor", "recursive", "kv_sharing", "precision", "num_warmup_steps", "gradient_accumulation_steps"]
+        self.config.mor_routing = OmegaConf.to_container(OmegaConf.masked_copy(cfg, keys), resolve=True)
 
     def transform_layer_to_mor_expert(self, cfg):
         from model.mor_model.expert_choice_router import MoRLlamaDecoderLayer
@@ -384,27 +357,6 @@ class MoRLlamaForCausalLM(LlamaForCausalLM):
 
         self._wrap_recursions(cfg, wrap_group)
 
-    def set_kv_sharing_config(self, cfg):
-        if cfg.kv_sharing.sharing in ["cycle", "sequence"]:
-            base_depth = self.config.num_hidden_layers // cfg.kv_sharing.num_recursion
-        elif cfg.kv_sharing.sharing in ["middle_cycle", "middle_sequence"]:
-            base_depth = (self.config.num_hidden_layers - 2) // cfg.kv_sharing.num_recursion
-        
-        if "kv_sharing" in cfg:                
-            kwargs = {
-                "enable": cfg.kv_sharing.enable,
-                "base_depth": base_depth,
-                "num_recursion": cfg.kv_sharing.num_recursion,
-                "sharing": cfg.kv_sharing.sharing,
-                "update_cache": cfg.kv_sharing.update_cache if "update_cache" in cfg.kv_sharing else False,
-            }        
-            self.model.config.kv_sharing = kwargs
-        else:
-            self.model.config.kv_sharing = None
-                    
-    @deprecate_kwarg("num_logits_to_keep", version="4.50", new_name="logits_to_keep")
-    @add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)
-    @replace_return_docstrings(output_type=MoRCausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -419,7 +371,7 @@ class MoRLlamaForCausalLM(LlamaForCausalLM):
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
-        **kwargs: Unpack[KwargsForCausalLM],
+        **kwargs: Unpack[TransformersKwargs],
     ) -> Union[Tuple, MoRCausalLMOutputWithPast]:
         r"""
         Args:
@@ -457,7 +409,7 @@ class MoRLlamaForCausalLM(LlamaForCausalLM):
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        return_dict = return_dict if return_dict is not None else self.config.return_dict
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = self.model(

@@ -60,6 +60,16 @@ Set `recursive.num_recursion`, `recursive.residual.lambda_r` and `recursive.resi
 python evaluate_fineweb_test.py --exp_names mor_expert_sequence_k3_rezero_seed1234 --sample_number 200
 ```
 
+To reload a routed checkpoint saved with Transformers 5.23.0 directly from Python:
+
+```python
+from model.mor_model.modeling_llama import MoRLlamaForCausalLM
+
+model = MoRLlamaForCausalLM.from_pretrained(
+    "results/pretrain/mor_expert_sequence_k3_rezero_seed1234", attn_implementation="sdpa"
+).eval()
+```
+
 Run the CPU regression suite with `python -m pytest -q tests/test_recursive_residual.py`. It uses tiny local Llama checkpoints to test pretrained preservation, sparse routing, signed gates, fixed coefficients, checkpoint restoration, and optimizer grouping.
 
 
@@ -98,18 +108,15 @@ To get started, follow these steps to set up your development environment. We re
     ```
 
 2.  **Install Required Packages:**
-    First, ensure your `pip` and `setuptools` are up to date. Then, install `torch` and the dependencies listed in [requirements.txt](https://github.com/raymin0223/mixture_of_recursions/tree/main/requirements.txt).
-
-    **Note:** We specifically used `torch==2.6.0+cu124`, `flash_attn==2.7.4.post1`, and `transformers==4.52.4`. If you encounter issues, consider these exact versions.
+    Install the PyTorch build for your hardware, then install this branch's requirements. The recursive residual implementation targets **Transformers 5.23.0**. Training writes safetensors checkpoints and the evaluation scripts also read previous PyTorch weight files. On resume, Trainer replays the consumed batches in the current epoch to restore the packed sequence order. This replay takes longer for checkpoints deep into a large epoch.
 
     ```bash
-    pip install --upgrade pip
-    pip install --upgrade setuptools
-    pip install torch
-    pip install -r requirements.txt
-    # If you experience issues with flash-attn, try:
-    # pip install flash-attn --no-build-isolation
+    python -m pip install -r requirements.txt
+    # For the default flash_attention_2 configuration on a supported GPU:
+    python -m pip install flash-attn --no-build-isolation
     ```
+
+    To use PyTorch attention without FlashAttention, pass `attn_implementation=sdpa` to the experiment command.
 
 
 ## 📚 Dataset Download
@@ -157,7 +164,7 @@ For details on the dataset used, please refer to the [lm_dataset](https://github
 
 ### 👉 MoR Architecture
 
-Our models are built upon the Llama architecture, specifically by modifying the [LlamaForCausalLM](https://github.com/huggingface/transformers/blob/v4.53.2/src/transformers/models/llama/modeling_llama.py#L475-L581) class.
+Our models are built upon the Llama architecture, specifically by modifying the [LlamaForCausalLM](https://github.com/huggingface/transformers/blob/v5.23.0/src/transformers/models/llama/modeling_llama.py) class.
 The Expert-choice and Token-choice versions of our MoR architecture can be found in [expert_choice_router.py](https://github.com/raymin0223/mixture_of_recursions/tree/main/model/mor_model/expert_choice_router.py) and [token_choice_router.py](https://github.com/raymin0223/mixture_of_recursions/tree/main/model/mor_model/token_choice_router.py), respectively. 
 
 The high-level routing process follows these steps:

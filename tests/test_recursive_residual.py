@@ -6,12 +6,13 @@ import pytest
 import torch
 from omegaconf import OmegaConf
 from torch import nn
-from transformers import LlamaConfig, TrainingArguments
+from transformers import LlamaConfig, LlamaForCausalLM as HFLlamaForCausalLM, TrainingArguments
 
 from model.mor_model.modeling_llama import MoRLlamaForCausalLM
 from model.recursive_model.modeling_llama import LlamaForCausalLM
 from model.recursive_residual import stage_scales
 from model.sharing_strategy.llama import sharing_strategy
+from util.checkpoint import load_model_weights
 from util.trainer_pt import MoRTrainer
 
 PRESET = Path(__file__).resolve().parents[1] / "conf/pretrain/recursive_residual.yaml"
@@ -84,7 +85,7 @@ def test_dense_layout_and_checkpoints(sharing, tmp_path):
         gate.data.fill_(i - 1.5)
     ids = torch.arange(12).view(2, 6)
     model.eval()
-    model.save_pretrained(tmp_path, safe_serialization=False)
+    model.save_pretrained(tmp_path)
     loaded = LlamaForCausalLM.from_pretrained(tmp_path, attn_implementation="eager")
     torch.testing.assert_close(loaded(ids).logits, model(ids).logits, rtol=0, atol=0)
 
@@ -174,7 +175,7 @@ def test_sparse_routes_match_fixed_ablations(router):
 def test_gate_gradients_groups_and_reload(router, checkpointing, sharing, tmp_path):
     model, cfg = tiny_model(router=router, sharing=sharing)
     if checkpointing:
-        model.gradient_checkpointing_enable({"use_reentrant": False})
+        model.activation_checkpointing_enable({"use_reentrant": False})
     args = TrainingArguments(output_dir=str(tmp_path), use_cpu=True, weight_decay=0.1, report_to=[])
     trainer = MoRTrainer(model=model, cfg=cfg, args=args)
     optimizer = trainer.create_optimizer()
@@ -189,9 +190,12 @@ def test_gate_gradients_groups_and_reload(router, checkpointing, sharing, tmp_pa
     optimizer.step()
     assert all(p.detach().abs() > 0 for p in gates(model))
     assert all(m.training_step == 1 for m in model.modules() if getattr(m, "mor", False))
-    model.save_pretrained(tmp_path, safe_serialization=False)
+    model.save_pretrained(tmp_path)
     reloaded, _ = tiny_model(router=router, sharing=sharing)
-    reloaded.load_state_dict(torch.load(tmp_path / "pytorch_model.bin", weights_only=True))
+    load_model_weights(reloaded, tmp_path)
+    native_reload = MoRLlamaForCausalLM.from_pretrained(tmp_path, attn_implementation="eager")
+    assert sum(p.numel() for p in native_reload.parameters()) == sum(p.numel() for p in model.parameters())
+    torch.testing.assert_close(native_reload.eval()(ids).logits, model.eval()(ids).logits, atol=0, rtol=0)
     torch.testing.assert_close(reloaded.eval()(ids).logits, model.eval()(ids).logits, atol=0, rtol=0)
 
 
@@ -209,7 +213,7 @@ def test_preserves_entire_pretrained_model(router, sharing, share_kv, tmp_path):
     config = LlamaConfig(vocab_size=48, num_hidden_layers=4, hidden_size=12, intermediate_size=24,
                          num_attention_heads=3, num_key_value_heads=1, max_position_embeddings=32)
     config._attn_implementation = "eager"
-    dense = LlamaForCausalLM(config).eval()
+    dense = HFLlamaForCausalLM(config).eval()
     dense.save_pretrained(tmp_path)
     model = MoRLlamaForCausalLM.from_pretrained(tmp_path, attn_implementation="eager")
     model, _ = sharing_strategy(cfg, model)
@@ -225,3 +229,49 @@ def test_preserves_entire_pretrained_model(router, sharing, share_kv, tmp_path):
     ids = torch.arange(24).view(3, 8)
     torch.testing.assert_close(model.eval()(ids, use_cache=share_kv).logits,
                                dense(ids, use_cache=False).logits, atol=1e-7, rtol=1e-6)
+
+
+@pytest.mark.parametrize("backend", ["eager", "sdpa"])
+@pytest.mark.parametrize("router", ["token", "expert"])
+@torch.no_grad()
+def test_cached_sparse_decode_matches_individual_rows(backend, router):
+    model, _ = tiny_model(router=router, sharing="sequence")
+    model.eval().set_attn_implementation(backend)
+    for gate in gates(model):
+        gate.fill_(0.7)
+    sequences = torch.tensor([[1, 4, 3, 2, 18, 22], [3, 2, 9, 8, 14, 6], [8, 11, 6, 1, 7, 20]])
+
+    def decode(tokens):
+        out = model(tokens[:, :4], use_cache=True)
+        torch.testing.assert_close(out.logits, model(tokens[:, :4], use_cache=False).logits,
+                                   atol=2e-6, rtol=1e-5)
+        logits = []
+        for pos in range(4, 6):
+            out = model(tokens[:, pos:pos + 1], past_key_values=out.past_key_values, use_cache=True)
+            logits.append(out.logits)
+            if router == "token":
+                # Token-choice decisions depend only on each token's causal hidden state.
+                reference = model(tokens[:, :pos + 1], use_cache=False).logits[:, -1:]
+                torch.testing.assert_close(out.logits, reference, atol=2e-6, rtol=1e-5)
+        return torch.cat(logits, dim=1)
+
+    batched = decode(sequences)
+    individual = torch.cat([decode(row[None]) for row in sequences])
+    torch.testing.assert_close(batched, individual, atol=2e-6, rtol=1e-5)
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_checkpoint_formats_and_shards(tmp_path, legacy):
+    source, _ = tiny_model(router="token")
+    with torch.no_grad():
+        for gate in gates(source):
+            gate.fill_(-1.25)
+    if legacy:
+        torch.save(source.state_dict(), tmp_path / "pytorch_model.bin")
+    else:
+        source.save_pretrained(tmp_path, max_shard_size="4KB")
+        assert (tmp_path / "model.safetensors.index.json").is_file()
+    target, _ = tiny_model(router="token")
+    load_model_weights(target, tmp_path)
+    for name, value in source.state_dict().items():
+        torch.testing.assert_close(target.state_dict()[name], value, atol=0, rtol=0)

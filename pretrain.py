@@ -1,3 +1,4 @@
+from util.checkpoint import load_model_weights
 import os 
 os.environ["HYDRA_FULL_ERROR"] = "1"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -69,11 +70,8 @@ def main(cfg: DictConfig):
 
     print ("Loading dataset...")
     train_dataset = load_dataset_from_config(cfg, tokenizer)
-    if cfg.resume_from_checkpoint:
-        latest_checkpoint = get_latest_checkpoint_path(cfg, resume_step=cfg.resume_step if ("resume_step" in cfg and cfg.resume_step is not None) else None)
-        train_dataset.load_state_dict(
-            torch.load(os.path.join(str(latest_checkpoint), "dataset.pt"))
-        )
+    # The v5 Trainer replays consumed batches on resume. A dataset snapshot here
+    # includes Accelerate's prefetched next batch and would skip real examples.
 
     print ("Loading models...")
     model = load_model_from_config(cfg)
@@ -91,8 +89,7 @@ def main(cfg: DictConfig):
         if cfg.resume_from_checkpoint:
             if cfg.relaxation.get("enable"):
                 latest_checkpoint = get_latest_checkpoint_path(cfg, resume_step=cfg.resume_step if ("resume_step" in cfg and cfg.resume_step is not None) else None)                
-                state_dict = torch.load(os.path.join(str(latest_checkpoint), "pytorch_model.bin"))
-                model.get_base_model().load_state_dict(state_dict)
+                load_model_weights(model.get_base_model(), latest_checkpoint)
                 
     if "mor" in cfg and cfg.mor.get("enable"):            
         if cfg.mor.type == "expert":
@@ -117,6 +114,8 @@ def main(cfg: DictConfig):
         with open(ds_config) as f:
             ds_config = json.load(f)
         ds_config.pop("optimizer", None)
+    if cfg.get("tensorboard"):
+        os.environ["TENSORBOARD_LOGGING_DIR"] = str(cfg.tensorboard_dir)
     train_args = TrainingArguments(
         seed=cfg.get("seed", 42),
         lr_scheduler_type=cfg.get("lr_scheduler_type", "cosine_with_min_lr"),
@@ -132,19 +131,16 @@ def main(cfg: DictConfig):
         logging_steps=cfg.logging_steps,
         save_steps=cfg.save_steps,
         save_total_limit=cfg.save_total_limit,
-        save_safetensors=launcher_type != "accelerate" and residual is None,
         gradient_accumulation_steps=cfg.gradient_accumulation_steps,
-        gradient_checkpointing=cfg.gradient_checkpointing,
-        gradient_checkpointing_kwargs={"use_reentrant": False} if residual is not None else None,
+        activation_checkpointing=cfg.gradient_checkpointing,
+        activation_checkpointing_kwargs={"use_reentrant": False} if residual is not None else None,
         ddp_find_unused_parameters=True if residual is not None and cfg.get("mor", {}).get("enable") else None,
         max_grad_norm=cfg.max_grad_norm,
         dataloader_num_workers=cfg.dataloader_num_workers,
         bf16=cfg.precision == "bf16",
         fp16=cfg.precision == "fp16",
-        overwrite_output_dir=True,
         report_to=report_to,
         run_name=cfg.wandb_run_name,
-        logging_dir=cfg.tensorboard_dir,
         deepspeed=ds_config,
         log_on_each_node=False,
     )
@@ -178,7 +174,7 @@ def main(cfg: DictConfig):
     trainer.save_model()
     
     if cfg.relaxation.get("enable"):
-        trainer.model.base_model.model.save_pretrained(train_args.output_dir, safe_serialization=False)
+        trainer.model.base_model.model.save_pretrained(train_args.output_dir)
     
     
 if __name__ == "__main__":
