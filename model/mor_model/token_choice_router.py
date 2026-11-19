@@ -10,7 +10,7 @@ from transformers.processing_utils import Unpack
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 
 from model.kv_caches.cache_utils import Cache, StaticCache, DynamicCache
-from model.mor_model.util import ROUTER_TYPES, MoRLayerOutputWithPast
+from model.mor_model.util import ROUTER_TYPES, MoRLayerOutputWithPast, run_decoder_block
 from util.misc import get_torch_dtype
 
 
@@ -27,6 +27,7 @@ class MoRLlamaDecoderLayer(nn.Module):
         self.config = config
         self.block_list = block_list
         self.cfg = cfg
+        self.residual_recursion = cfg.recursive.get("residual") is not None
         self.bal_warmup_step = bal_warmup_step
         
         self.training_step = 0
@@ -118,14 +119,19 @@ class MoRLlamaDecoderLayer(nn.Module):
                     indices = selected_seq_indices[b]
                     s = indices.numel()
                     
-                    _mask = torch.gather(attention_mask, 2, indices.view(1, 1, s, 1).expand(bs, 1, s, seq_len))
-                    _mask = torch.gather(_mask, 3, indices.view(1, 1, 1, s).expand(bs, 1, s, s))
-                    new_attention_mask[b, :, :s, :s] = _mask                
+                    batch_idx = selected_batch_indices[b] if attention_mask.size(0) > 1 else 0
+                    mask = attention_mask[batch_idx].index_select(1, indices).index_select(2, indices)
+                    new_attention_mask[b, :, :s, :s] = mask
             elif attention_mask.dim() == 2:
-                pass
+                for row, (batch_idx, positions) in enumerate(zip(selected_batch_indices, selected_seq_indices)):
+                    new_attention_mask[row, :positions.numel()] = attention_mask[batch_idx, positions]
             else: 
                 raise NotImplementedError("Attention mask has unexpected dimensions")
         
+        elif self.config._attn_implementation == "sdpa":
+            # Right padding follows all real keys, so causal SDPA can use its native mask.
+            new_attention_mask = None
+
         new_position_ids = None
         if position_ids is not None:
             new_position_ids = torch.arange(new_seq_len, dtype=torch.long, device=x.device).unsqueeze(0).to(position_ids.device)
@@ -144,7 +150,8 @@ class MoRLlamaDecoderLayer(nn.Module):
                 for b in range(new_bs):
                     indices = selected_seq_indices[b]
                     s = indices.numel()
-                    new_position_embeddings[i][b, :s] = torch.gather(emb[0], dim=0, index=indices.view(s, 1).expand(-1, head_dim))
+                    batch_idx = selected_batch_indices[b] if emb.size(0) > 1 else 0
+                    new_position_embeddings[i][b, :s] = emb[batch_idx].index_select(0, indices)
         
         new_cache_position = None                    
         if cache_position is not None:
@@ -172,6 +179,7 @@ class MoRLlamaDecoderLayer(nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         prev_selected_tokens: Optional[torch.LongTensor] = None,
+        checkpoint_block=None,
         **kwargs: Unpack[FlashAttentionKwargs]
     ):
         bs, seq_len, hidden_dim =  x.shape
@@ -179,7 +187,8 @@ class MoRLlamaDecoderLayer(nn.Module):
         if self.training:
             self.training_step += 1
                     
-        final_x, updates = x.clone(), x.clone()
+        if not self.residual_recursion:
+            final_x, updates = x.clone(), x.clone()
         
         if not self.cfg.mor.rand_router:
             # Top-1 token-choice routing
@@ -205,10 +214,12 @@ class MoRLlamaDecoderLayer(nn.Module):
         weights = torch.gather(_router_probs, dim=-1, index=top_expert_indices) # [bs, seq_len, 1]
         top_expert_indices = top_expert_indices.squeeze(-1)  # [bs, seq_len]
         
+        share_kv = self.cfg.get("kv_sharing", {}).get("enable", False)
         for index, block in enumerate(self.block_list): 
                         
-            if 'kv_sharing' in self.cfg and self.cfg.kv_sharing.enable:
+            if share_kv:
                 batched_x = x.clone()
+                active = (top_expert_indices >= index).unsqueeze(-1) if self.residual_recursion else None
                 new_attention_mask = attention_mask
                 new_position_ids = position_ids
                 new_cache_position = cache_position
@@ -231,8 +242,8 @@ class MoRLlamaDecoderLayer(nn.Module):
                     continue
             
             for blk in block: 
-                outputs = blk(
-                    batched_x,
+                outputs = run_decoder_block(
+                    blk, batched_x, checkpoint_block,
                     attention_mask=new_attention_mask,
                     position_ids=new_position_ids,
                     past_key_value=past_key_value,
@@ -242,9 +253,12 @@ class MoRLlamaDecoderLayer(nn.Module):
                     position_embeddings=new_position_embeddings,
                     **kwargs
                 )
-                batched_x = outputs[0]
+                if self.residual_recursion and share_kv:
+                    batched_x = torch.where(active, outputs[0], batched_x)
+                else:
+                    batched_x = outputs[0]
                 
-            if 'kv_sharing' in self.cfg and self.cfg.kv_sharing.enable:
+            if share_kv:
                 batched_x_processed, _, _, _, _, selected_batch_indices, selected_seq_indices = \
                     self.select_tokens_and_batch_with_padding(
                             batched_x,
@@ -260,17 +274,25 @@ class MoRLlamaDecoderLayer(nn.Module):
             else:
                 batched_x_processed = outputs[0]
         
+            if self.residual_recursion:
+                # Carry the state of exited tokens across all subsequent stages.
+                updates = x.clone()
+                for row, (batch_idx, positions) in enumerate(zip(selected_batch_indices, selected_seq_indices)):
+                    updates[batch_idx, positions] = batched_x_processed[row, :positions.numel()]
+                x = updates
+                continue
+
             for i, batch_idx in enumerate(selected_batch_indices):
                 
                 processed_indices = selected_seq_indices[i] 
                 processed_unpad_x = batched_x_processed[i, :processed_indices.numel()] 
-                processed_expert_indices = torch.gather(top_expert_indices[i], dim=0, index=processed_indices)
+                processed_expert_indices = torch.gather(top_expert_indices[batch_idx], dim=0, index=processed_indices)
                 
                 finished_indices = torch.where(processed_expert_indices == index)[0]
                 finished_indices_in_total = processed_indices[finished_indices]
                 
                 finished_x = torch.gather(processed_unpad_x, dim=0, index=finished_indices.view(-1, 1).expand(-1, hidden_dim)) 
-                finished_w = torch.gather(weights[i], dim=0, index=finished_indices_in_total.view(-1, 1)) 
+                finished_w = torch.gather(weights[batch_idx], dim=0, index=finished_indices_in_total.view(-1, 1))
                 finished_src = finished_x * finished_w if self.cfg.mor.token.get("gating", "weighted") == "weighted" else finished_x
             
                 final_x[batch_idx] = torch.scatter_add(
@@ -315,7 +337,7 @@ class MoRLlamaDecoderLayer(nn.Module):
                 router_z_loss = router_z_loss.mean() / (kwargs["num_items_in_batch"] / bs / seq_len)           
             
         return MoRLayerOutputWithPast(
-            hidden_state=final_x,
+            hidden_state=x if self.residual_recursion else final_x,
             attention_weights=outputs[1:],
             selected_tokens=None,
             sampling_loss=None,

@@ -5,6 +5,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from model.recursive_residual import configure_residual_layers
 from util.misc import get_torch_dtype
 
 
@@ -238,6 +239,33 @@ def sharing_strategy(cfg, model):
     sharing_strategy = cfg.recursive.sharing
     init_strategy = cfg.recursive.initialization
     
+    if init_strategy == "pretrained":
+        # Expand the virtual execution order while retaining every pretrained
+        # physical block. Each execution needs its own cache index and gate.
+        k = cfg.recursive.num_recursion
+        middle = sharing_strategy.startswith("middle_")
+        original = list(model.model.layers)
+        physical = original[1:-1] if middle else original
+        if k < 1 or not physical:
+            raise ValueError("Pretrained recursion needs a positive depth and at least one shared block")
+        stages = []
+        for layer in physical:
+            memo = {id(p): p for n, p in layer.named_parameters()
+                    if cfg.recursive.ln_share or "layernorm" not in n}
+            memo[id(model.config)] = model.config
+            stages.append([layer] + [deepcopy(layer, memo.copy()) for _ in range(1, k)])
+        order = zip(*stages) if sharing_strategy.endswith("cycle") else stages
+        layers = [layer for group in order for layer in group]
+        if middle:
+            layers = [original[0], *layers, original[-1]]
+        model.model.layers = nn.ModuleList(layers)
+        model.config.num_hidden_layers = len(layers)
+        for idx, layer in enumerate(layers):
+            layer.self_attn.layer_idx = idx
+        if not (cfg.get("mor") and cfg.mor.enable):
+            configure_residual_layers(model, cfg.recursive)
+        return model, {}
+
     if cfg.recursive.num_recursion == 1:
         base_depth = cfg.recursive.base_depth
         num_recursion = model.config.num_hidden_layers // base_depth
@@ -310,4 +338,6 @@ def sharing_strategy(cfg, model):
                     for idx in idxs[1:]:
                         getattr(model.model.layers[idx], key).weight = ref_weights #[key]
     
+    if not (cfg.get("mor") and cfg.mor.enable):
+        configure_residual_layers(model, cfg.recursive)
     return model, lora_init_dict

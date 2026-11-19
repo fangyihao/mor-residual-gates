@@ -1,10 +1,18 @@
 from dataclasses import dataclass
+from functools import partial
 from typing import Callable, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 
 from transformers.utils import ModelOutput
+
+
+def run_decoder_block(block, hidden_states, checkpoint_block, **kwargs):
+    if checkpoint_block is None:
+        return block(hidden_states, **kwargs)
+    # Recompute just the decoder block. Routing and capacity warmup run once.
+    return checkpoint_block(partial(block.__call__, **kwargs), hidden_states)
 
 
 class LinearRouter(nn.Module):

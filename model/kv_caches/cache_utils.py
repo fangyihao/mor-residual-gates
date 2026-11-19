@@ -475,7 +475,7 @@ class RecursiveDynamicCache(DynamicCache):
         self.num_recursion = num_recursion
         self.sharing = sharing
         self.update_cache = update_cache
-        assert sharing in ["cycle", "middle_cycle", "sequence"], f"Invalid sharing type: {sharing}. Must be one of ['cycle', 'middle_cycle', 'sequence']"
+        assert sharing in ["cycle", "middle_cycle", "sequence", "middle_sequence"], f"Invalid sharing type: {sharing}"
 
     def __getitem__(self, layer_idx: int) -> List[Tuple[torch.Tensor]]:
         """
@@ -483,15 +483,21 @@ class RecursiveDynamicCache(DynamicCache):
         sequence length.
         """
         
-        if self.sharing == "cycle":
-            return self.key_cache[layer_idx % self.base_depth], self.value_cache[layer_idx % self.base_depth]
-        elif self.sharing == "middle_cycle":
-            if layer_idx == self.base_depth * self.num_recursion + 1:
-                return self.key_cache[self.base_depth + 1], self.value_cache[self.base_depth + 1]
-            else:
-                return self.key_cache[1 + (layer_idx - 1) % self.base_depth], self.value_cache[1 + (layer_idx - 1) % self.base_depth]
-        elif self.sharing == "sequence":
-            return self.key_cache[layer_idx // self.base_depth], self.value_cache[layer_idx // self.base_depth]
+        physical, _ = self._physical_stage(layer_idx)
+        return self.key_cache[physical], self.value_cache[physical]
+
+    def _physical_stage(self, layer_idx):
+        middle = self.sharing.startswith("middle_")
+        if middle and layer_idx == 0:
+            return 0, 0
+        pos = layer_idx - int(middle)
+        if middle and pos == self.base_depth * self.num_recursion:
+            return self.base_depth + 1, 0
+        if self.sharing.endswith("sequence"):
+            physical, stage = divmod(pos, self.num_recursion)
+        else:
+            stage, physical = divmod(pos, self.base_depth)
+        return physical + int(middle), stage
 
     def _update(
         self,
@@ -542,47 +548,17 @@ class RecursiveDynamicCache(DynamicCache):
         if layer_idx == 0:
             self._seen_tokens += key_states.shape[-2]
 
-        # Update the cache
-        if key_states is not None:
-            if self.sharing == "cycle":
-                if layer_idx < self.base_depth:
-                    self._update(key_states, value_states, layer_idx)
-                else:
-                    return self.key_cache[layer_idx % self.base_depth], self.value_cache[layer_idx % self.base_depth]
-                
-            elif self.sharing == "middle_cycle":
-                if layer_idx < self.base_depth + 1 or layer_idx == self.base_depth * self.num_recursion + 1:
-                    if layer_idx == self.base_depth * self.num_recursion + 1:
-                        layer_idx = self.base_depth + 1
-                    self._update(key_states, value_states, layer_idx)
-                else:
-                    if not self.update_cache:
-                        return self.key_cache[1 + (layer_idx - 1) % self.base_depth], self.value_cache[1 + (layer_idx - 1) % self.base_depth]
-                    else:
-                        assert "selected_tokens" in cache_kwargs, "selected_tokens must be provided when update_cache is True"
-                        _, num_heads, _, head_dim = key_states.shape
-                        selected_tokens = cache_kwargs.get("selected_tokens")
-                        selected_tokens = selected_tokens.unsqueeze(1).expand(-1, num_heads, -1, head_dim)
-                        
-                        key_cache = torch.scatter(
-                            self.key_cache[1 + (layer_idx - 1) % self.base_depth],
-                            dim=2,
-                            index=selected_tokens,
-                            src=torch.gather(key_states, dim=2, index=selected_tokens),
-                        )
-                        value_cache = torch.scatter(
-                            self.value_cache[1 + (layer_idx - 1) % self.base_depth],
-                            dim=2,
-                            index=selected_tokens,
-                            src=torch.gather(value_states, dim=2, index=selected_tokens),
-                        )
-                        return key_cache, value_cache
-                        
-            elif self.sharing == "sequence":
-                if layer_idx % self.num_recursion == 0:
-                    layer_idx = layer_idx // self.num_recursion
-                    self._update(key_states, value_states, layer_idx)
-                else:
-                    return self.key_cache[layer_idx // self.num_recursion], self.value_cache[layer_idx // self.num_recursion]
-
-        return self.key_cache[layer_idx], self.value_cache[layer_idx]
+        physical, stage = self._physical_stage(layer_idx)
+        if key_states is None:
+            return self.key_cache[physical], self.value_cache[physical]
+        if stage == 0:
+            self._update(key_states, value_states, physical)
+        elif self.update_cache and cache_kwargs is not None and "selected_tokens" in cache_kwargs:
+            positions = cache_kwargs["selected_tokens"].unsqueeze(1)
+            indices = positions.expand(-1, key_states.size(1), -1, key_states.size(-1))
+            # Selected positions are local to this input. Prefix keys occupy earlier cache entries.
+            offset = self.key_cache[physical].size(2) - key_states.size(2)
+            keys = self.key_cache[physical].scatter(2, indices + offset, key_states.gather(2, indices))
+            values = self.value_cache[physical].scatter(2, indices + offset, value_states.gather(2, indices))
+            return keys, values
+        return self.key_cache[physical], self.value_cache[physical]

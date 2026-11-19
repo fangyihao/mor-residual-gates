@@ -104,10 +104,13 @@ def preprocess_config(cfg: DictConfig):
         with open_dict(cfg):
             cfg.max_grad_norm = 1.0  # default value
 
+    if cfg.get("recursive") and cfg.recursive.get("residual") is not None and not cfg.recursive.get("enable"):
+        raise ValueError("recursive.residual requires recursive.enable=true")
+
     if cfg.get("recursive") and cfg.recursive.get("enable"):
         assert cfg.recursive.get("num_recursion"), "num_recursion should be specified"
         
-        if cfg.recursive.num_recursion == 1:
+        if cfg.recursive.num_recursion == 1 and cfg.recursive.initialization != "pretrained":
             assert cfg.recursive.get("base_depth"), "base_depth should be specified"
             assert cfg.recursive.sharing in ["cycle", "sequence"], "sharing should be either cycle or sequence"
             
@@ -129,9 +132,14 @@ def preprocess_config(cfg: DictConfig):
         if cfg.mor.capacity is None:
             cfg.mor.capacity = ",".join([str((cfg.recursive.num_recursion - i) / cfg.recursive.num_recursion) for i in range(cfg.recursive.num_recursion)])
         
-        assert cfg.recursive.num_recursion > 1, "num_recursion should be greater than 1 for moR"        
+        if cfg.recursive.get("residual") is None:
+            assert cfg.recursive.num_recursion > 1, "num_recursion should be greater than 1 for moR"
         assert len(cfg.mor.capacity.split(',')) == cfg.recursive.num_recursion, "capacity should be a list of length num_recursion"
-        assert cfg.recursive.sharing in ["cycle", "middle_cycle"], "sharing should be either cycle or middle_cycle"
+        layouts = {"cycle", "middle_cycle"}
+        if cfg.recursive.get("residual") is not None:
+            layouts.update({"sequence", "middle_sequence"})
+        if cfg.recursive.sharing not in layouts:
+            raise ValueError(f"Unsupported MoR sharing layout {cfg.recursive.sharing!r}")
         
         if cfg.mor.type == "expert":
             capacity = [float(x) for x in cfg.mor.capacity.split(',')]
@@ -143,6 +151,13 @@ def preprocess_config(cfg: DictConfig):
     return cfg
 
 
+def training_config_path(run_dir, config_dir):
+    saved = os.path.join(run_dir, "training_config.yaml")
+    if os.path.isfile(saved):
+        return saved
+    return os.path.join(PROJECT_ROOT, config_dir, f"{os.path.basename(run_dir)}.yaml")
+
+
 def overwrite_eval_config(eval_cfg: DictConfig):
     """
     For evaluation config, overwrite the config if there is the same name of training config file.
@@ -150,7 +165,7 @@ def overwrite_eval_config(eval_cfg: DictConfig):
     
     overwrite_keys = ["max_length", "add_bos_token", "tokenizer", "model", "attn_implementation", "model_config", "precision", 
                       "kv_sharing", "recursive", "relaxation", "mor", "num_train_steps", "num_warmup_steps", "gradient_accumulation_steps",]
-    train_cfg_path = os.path.join(PROJECT_ROOT, eval_cfg.train_cfg_fpath, f"{eval_cfg.model_name_or_path.split('/')[-1]}.yaml")
+    train_cfg_path = training_config_path(os.path.join(SAVE_DIR, eval_cfg.model_name_or_path), eval_cfg.train_cfg_fpath)
     
     if os.path.exists(train_cfg_path):
         train_cfg = OmegaConf.load(train_cfg_path)

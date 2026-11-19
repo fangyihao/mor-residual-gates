@@ -67,18 +67,7 @@ TRAINER_STATE_NAME = "trainer_state.json"
 logger = logging.get_logger(__name__)
 
 
-class MoRTrainer(Trainer):
-    def __init__(self, *args, cfg=None, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.sam_tr_loss = torch.tensor(0.0).to(self.args.device)  # for logging sampling_loss from MoR
-        self.sam_tr_acc = torch.tensor(0.0).to(self.args.device)  # for logging sampling_acc from MoR
-        self.sam_tr_topk_acc = torch.tensor(0.0).to(self.args.device)  # for logging sampling_topk_acc from MoR
-        self.bal_tr_loss = torch.tensor(0.0).to(self.args.device)  # for logging balancing_loss from MoR
-        self.bal_tr_ratio = torch.tensor([0.0] * cfg.recursive.num_recursion).to(self.args.device)  # for logging balancing_ratio from MoR
-        self.bal_tr_entropy = torch.tensor(0.0).to(self.args.device)  # for logging balancing_entropy from MoR
-        self.router_z_loss = torch.tensor(0.0).to(self.args.device)  # for logging router_z_loss from MoR
-        self.cfg = cfg
-        
+class RecursiveTrainer(Trainer):
     def create_optimizer(self):
         """
         Setup the optimizer.
@@ -90,20 +79,22 @@ class MoRTrainer(Trainer):
 
         if self.optimizer is None:
             decay_parameters = self.get_decay_parameter_names(opt_model)
+            decay, no_decay, gates = [], [], []
+            for name, param in opt_model.named_parameters():
+                if not param.requires_grad or "mlp_router" in name:
+                    continue
+                if name.endswith(".recursive_gate"):
+                    gates.append(param)
+                elif name in decay_parameters:
+                    decay.append(param)
+                else:
+                    no_decay.append(param)
             optimizer_grouped_parameters = [
-                {
-                    "params": [
-                        p for n, p in opt_model.named_parameters() if (n in decay_parameters and "mlp_router" not in n and p.requires_grad)
-                    ],
-                    "weight_decay": self.args.weight_decay,
-                },
-                {
-                    "params": [
-                        p for n, p in opt_model.named_parameters() if (n not in decay_parameters and "mlp_router" not in n and p.requires_grad)
-                    ],
-                    "weight_decay": 0.0,
-                },
+                {"params": decay, "weight_decay": self.args.weight_decay},
+                {"params": no_decay, "weight_decay": 0.0},
             ]
+            if gates:
+                optimizer_grouped_parameters.append({"params": gates, "weight_decay": 0.0, "name": "recursive_gates"})
 
             if self.optimizer_cls_and_kwargs is not None:
                 optimizer_cls, optimizer_kwargs = self.optimizer_cls_and_kwargs
@@ -145,6 +136,19 @@ class MoRTrainer(Trainer):
             self.optimizer = smp.DistributedOptimizer(self.optimizer)
 
         return self.optimizer
+
+
+class MoRTrainer(RecursiveTrainer):
+    def __init__(self, *args, cfg=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.sam_tr_loss = torch.tensor(0.0).to(self.args.device)  # for logging sampling_loss from MoR
+        self.sam_tr_acc = torch.tensor(0.0).to(self.args.device)  # for logging sampling_acc from MoR
+        self.sam_tr_topk_acc = torch.tensor(0.0).to(self.args.device)  # for logging sampling_topk_acc from MoR
+        self.bal_tr_loss = torch.tensor(0.0).to(self.args.device)  # for logging balancing_loss from MoR
+        self.bal_tr_ratio = torch.tensor([0.0] * cfg.recursive.num_recursion).to(self.args.device)  # for logging balancing_ratio from MoR
+        self.bal_tr_entropy = torch.tensor(0.0).to(self.args.device)  # for logging balancing_entropy from MoR
+        self.router_z_loss = torch.tensor(0.0).to(self.args.device)  # for logging router_z_loss from MoR
+        self.cfg = cfg
         
     def create_sampling_optimizer_and_scheduler(self, num_training_steps):
         self.create_sampling_optimizer()
@@ -738,15 +742,14 @@ class MoRTrainer(Trainer):
                             
                             if self.cfg.mor.token.balancing == "loss_free":
                                 with torch.no_grad():
-                                    avg_expert_ratio = torch.mean(self.bal_tr_ratio).expand(self.bal_tr_ratio.numel())
-                                    eps_i = avg_expert_ratio - self.bal_tr_ratio
-                                        
-                                    if self.cfg.recursive.sharing == "cycle":
-                                        self.model.model.layers.router_bias.data += self.cfg.mor.token.u * torch.sign(eps_i)
-                                    elif self.cfg.recursive.sharing == "middle_cycle":
-                                        self.model.model.layers[1].router_bias.data += self.cfg.mor.token.u * torch.sign(eps_i)
-                                
-                            self.bal_tr_entropy += -torch.sum(self.bal_tr_ratio * torch.log(self.bal_tr_ratio + 1e-10))
+                                    ratios = self.bal_tr_ratio.reshape(-1, self.cfg.recursive.num_recursion)
+                                    bias_updates = (ratios.mean(dim=-1, keepdim=True) - ratios).sign()
+                                    routers = [layer for layer in self.model.model.layers if hasattr(layer, "router_bias")]
+                                    for layer, update in zip(routers, bias_updates, strict=True):
+                                        layer.router_bias.add_(self.cfg.mor.token.u * update)
+
+                            entropy = -(self.bal_tr_ratio * (self.bal_tr_ratio + 1e-10).log()).sum(dim=-1)
+                            self.bal_tr_entropy += entropy.mean()
                             self.bal_tr_ratio -= self.bal_tr_ratio
 
                         model.zero_grad()

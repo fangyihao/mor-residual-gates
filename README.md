@@ -12,6 +12,57 @@
 </p>
 
 
+## Learnable ReZero-style recursive residual gates
+
+The proposed experiment continues pretraining from SmolLM-360M. Each physical decoder layer runs once on every token. The router can then select up to $K-1$ extra executions of that layer. With sequence sharing, these executions are consecutive, and every token starts the next physical layer even if it exited the previous layer early.
+
+For each selected extra execution $j$, the whole attention-plus-MLP block returns $h + c_{l,j}(F_l(h)-h)$. The first execution always returns $F_l(h)$. The proposed method learns one independent, unconstrained scalar per physical layer and extra execution. The gates start at zero and have a dedicated AdamW parameter group with zero weight decay. A selected block still executes at zero so its gate receives a gradient.
+
+| Experiment | `recursive.residual.mode` | Extra-execution coefficient |
+| --- | --- | --- |
+| **Proposed ReZero-style gates** | `rezero` | Learned $\alpha_{l,j}$, initialized to zero |
+| Full-strength ablation | `full` | $1$ |
+| Uniform ablation | `uniform` | $\Lambda_R/(K-1)$ |
+| Normalized power-law ablation | `power` | $\Lambda_R j^{-\zeta}/\sum_{r=2}^{K} r^{-\zeta}$ |
+
+For example, with $K=3$, $\Lambda_R=1$ and $\zeta=1$, the extra-stage coefficients are $(0.5,0.5)$ for uniform and $(0.6,0.4)$ for power. `lambda_r` sets the sum of update coefficients across the available extra stages. The actual perturbation also depends on the block outputs and which stages a token reaches. Router capacity controls how many tokens execute a stage.
+
+The experiment preset uses `recursive.initialization=pretrained` to retain every source layer and tie its weights across executions. With $L$ source layers and sequence sharing, this gives $L(K-1)$ learned scalars. Zero gates reproduce the source model's one-pass representation at initialization. All four modes write the selected block's returned state back to the token. The original MoR presets use their published router-weighted scatter-add convention. In the four residual modes hard selection trains the router through its auxiliary objective. The preset uses expert choice with `aux_loss`. Token choice is available with `mor.type=token` and its balancing loss.
+
+### Running the four experiments
+
+Prepare FineWeb-Edu and the environment as described below. The fork reads the model and tokenizers from its local Hugging Face cache. To populate that cache on a fresh checkout, run from the repository root.
+
+```bash
+HF_HOME="$PWD/hf_cache" python - <<'PY'
+from huggingface_hub import snapshot_download
+from transformers import AutoTokenizer
+
+snapshot_download("HuggingFaceTB/SmolLM-360M", allow_patterns=["config.json", "*.safetensors", "*.index.json", "pytorch_model.bin"])
+for model in ("HuggingFaceTB/SmolLM-135M", "HuggingFaceTB/SmolLM2-135M"):
+    AutoTokenizer.from_pretrained(model)
+PY
+```
+
+The single-GPU example below uses the same pretrained weights, seed, router, $K=3$, data, and learning rate for all four experiments. To run only the proposal, use `rezero` as the sole mode.
+
+```bash
+for mode in rezero full uniform power; do
+    accelerate launch --config_file acc_configs/single_gpu_config.yaml \
+        pretrain.py --config-name recursive_residual \
+        recursive.residual.mode="$mode" || break
+done
+```
+
+Set `recursive.num_recursion`, `recursive.residual.lambda_r` and `recursive.residual.zeta` on the command line to change the schedules. Supply a distinct `name=...` when sweeping coefficients at the same mode and seed, since the training entry point resumes existing run directories. Each run saves its resolved input configuration next to its checkpoints. For the default proposal, evaluate held-out FineWeb loss with this command.
+
+```bash
+python evaluate_fineweb_test.py --exp_names mor_expert_sequence_k3_rezero_seed1234 --sample_number 200
+```
+
+Run the CPU regression suite with `python -m pytest -q tests/test_recursive_residual.py`. It uses tiny local Llama checkpoints to test pretrained preservation, sparse routing, signed gates, fixed coefficients, checkpoint restoration, and optimizer grouping.
+
+
 ## 🔥 Research Motivation
 
 **Early-exiting [[CALM](https://arxiv.org/abs/2207.07061)]**, an Adaptive Computation technique, helps LLMs run more efficiently by allowing them to skip unnecessary computations when they're confident in their predictions. This creates dynamic pathways through the model. However, putting early-exiting into practice faces **two main bottlenecks**:

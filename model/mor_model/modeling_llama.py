@@ -25,6 +25,7 @@ from transformers.utils import (
 from transformers import LlamaConfig
 from transformers.utils.deprecation import deprecate_kwarg
 
+from model.recursive_residual import configure_residual_layers
 from model.kv_caches.cache_utils import Cache, StaticCache, DynamicCache, RecursiveDynamicCache
 from model.base_model.modeling_llama import (
     LlamaModel, 
@@ -216,15 +217,17 @@ class MoRLlamaModel(LlamaModel):
         uniformity = None # torch.tensor(0.0, device=hidden_states.device)
         dead_token_seq = None # torch.tensor([0.0] * self.config.max_position_embeddings, device=hidden_states.device)
         balancing_loss = torch.tensor(0.0, device=hidden_states.device)
-        balancing_ratio = torch.tensor(0.0, device=hidden_states.device)
+        balancing_ratios = []
         router_z_loss = torch.tensor(0.0, device=hidden_states.device)
         
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:            
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            if self.gradient_checkpointing and self.training:
-                # TODO: support MoRLlamaDecoderLayer
+            checkpointing = self.gradient_checkpointing and self.training
+            checkpoint_blocks = checkpointing and getattr(decoder_layer, "residual_recursion", False)
+            if checkpointing and not checkpoint_blocks:
+                # Legacy routing configurations retain their checkpoint path.
                 layer_outputs = self._gradient_checkpointing_func(
                     decoder_layer.__call__,
                     hidden_states,
@@ -247,7 +250,8 @@ class MoRLlamaModel(LlamaModel):
                         use_cache=use_cache,
                         cache_position=cache_position,
                         position_embeddings=position_embeddings,
-                        prev_selected_tokens=prev_selected_tokens,
+                        prev_selected_tokens=None if getattr(decoder_layer, "first_stage", False) else prev_selected_tokens,
+                        checkpoint_block=self._gradient_checkpointing_func if checkpoint_blocks else None,
                         **flash_attn_kwargs,
                     )
                     if decoder_layer.mor_type == "expert":
@@ -267,11 +271,11 @@ class MoRLlamaModel(LlamaModel):
                             
                     elif decoder_layer.mor_type == "token":
                         if layer_outputs.balancing_loss is not None:
-                            balancing_loss = layer_outputs.balancing_loss
+                            balancing_loss += layer_outputs.balancing_loss
                         if layer_outputs.balancing_ratio is not None:
-                            balancing_ratio = layer_outputs.balancing_ratio
+                            balancing_ratios.append(layer_outputs.balancing_ratio)
                         if layer_outputs.router_z_loss is not None:
-                            router_z_loss = layer_outputs.router_z_loss
+                            router_z_loss += layer_outputs.router_z_loss
                 else:
                     layer_outputs = decoder_layer(
                         hidden_states,
@@ -296,19 +300,24 @@ class MoRLlamaModel(LlamaModel):
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
+        groups = getattr(self, "num_routing_groups", 1)
+        balancing_ratio = torch.tensor(0.0, device=hidden_states.device)
+        if balancing_ratios:
+            balancing_ratio = balancing_ratios[0] if groups == 1 else torch.stack(balancing_ratios)
+
         output = MoRBaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values if use_cache else None,
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
-            sampling_loss=sampling_loss,
+            sampling_loss=sampling_loss / groups,
             sampling_acc=sum(sampling_acc_list)/len(sampling_acc_list) if len(sampling_acc_list) > 0 else torch.tensor(0.0, device=hidden_states.device),
             sampling_topk_acc=sum(sampling_topk_acc_list)/len(sampling_topk_acc_list) if len(sampling_topk_acc_list) > 0 else torch.tensor(0.0, device=hidden_states.device),
             uniformity=uniformity,
             dead_token_seq=dead_token_seq,
-            balancing_loss=balancing_loss,
+            balancing_loss=balancing_loss / groups,
             balancing_ratio=balancing_ratio,
-            router_z_loss=router_z_loss,
+            router_z_loss=router_z_loss / groups,
         )
         return output if return_dict else output.to_tuple()
 
@@ -324,80 +333,61 @@ class MoRLlamaForCausalLM(LlamaForCausalLM):
         # Initialize weights and apply final processing
         self.post_init()
     
+    def _wrap_recursions(self, cfg, wrap_group):
+        configure_residual_layers(self, cfg.recursive)
+        layers = self.model.layers
+        k = cfg.recursive.num_recursion
+        sharing = cfg.recursive.sharing
+        middle = sharing.startswith("middle_")
+        body = layers[1:-1] if middle else layers
+        depth = len(body) // k
+        if sharing.endswith("cycle"):
+            groups = [[body[i:i + depth] for i in range(0, len(body), depth)]]
+        elif sharing.endswith("sequence"):
+            # Each physical layer makes an independent depth decision.
+            groups = [[body[i + j:i + j + 1] for j in range(k)] for i in range(0, len(body), k)]
+        else:
+            raise ValueError(f"Unknown sharing layout {sharing!r}")
+        wrapped = [module for group in groups for module in wrap_group(group)]
+        if middle:
+            wrapped = [layers[0], *wrapped, layers[-1]]
+        self.model.layers = nn.ModuleList(wrapped)
+        self.model.num_routing_groups = len(groups)
+
     def transform_layer_to_mor_expert(self, cfg):
         from model.mor_model.expert_choice_router import MoRLlamaDecoderLayer
-        
+
         capacity = [float(cap) for cap in cfg.mor.capacity.split(',')]
-        # warmup_step for capacity_factor
-        if "cap_warmup_step" in cfg.mor.expert and cfg.mor.expert.cap_warmup_step is not None:
-            cap_warmup_step = cfg.mor.expert.cap_warmup_step
-        else:
-            cap_warmup_step = cfg.num_warmup_steps * cfg.gradient_accumulation_steps
-        
-        sharing = cfg.recursive.sharing
-        num_recursion = cfg.recursive.num_recursion        
-        num_hidden_layers = len(self.model.layers)
-        
-        # Cycle sharing is for early-exiting mechanism
-        if sharing == "cycle":
-            base_depth = num_hidden_layers // num_recursion
-            self.model.layers = nn.ModuleList(
-                [
-                    MoRLlamaDecoderLayer(self.config, nn.ModuleList([self.model.layers[layer_idx + recur_idx * base_depth] for layer_idx in range(base_depth)]), 
-                                         cfg, capacity[recur_idx], cap_warmup_step,) 
-                    for recur_idx in range(num_recursion)
-                ]
-            )
-        elif sharing == "middle_cycle":
-            base_depth = (num_hidden_layers - 2) // num_recursion
-            self.model.layers = nn.ModuleList(
-                [self.model.layers[0]] + \
-                [
-                    MoRLlamaDecoderLayer(self.config, nn.ModuleList([self.model.layers[1 + layer_idx + recur_idx * base_depth] for layer_idx in range(base_depth)]), 
-                                         cfg, capacity[recur_idx], cap_warmup_step,)
-                    for recur_idx in range(num_recursion)
-                ]
-                + [self.model.layers[-1]]
-            )
-    
+        if cfg.recursive.get("residual") is not None and capacity[0] != 1.0:
+            raise ValueError("Recursive residual modes require a first-stage capacity of 1")
+        warmup = cfg.mor.expert.get("cap_warmup_step")
+        if warmup is None:
+            warmup = cfg.num_warmup_steps * cfg.gradient_accumulation_steps
+
+        def wrap_group(stages):
+            for stage, blocks in enumerate(stages):
+                wrapper = MoRLlamaDecoderLayer(self.config, blocks, cfg, capacity[stage], warmup)
+                wrapper.first_stage = stage == 0
+                yield wrapper
+
+        self._wrap_recursions(cfg, wrap_group)
+
     def transform_layer_to_mor_token(self, cfg):
         from model.mor_model.token_choice_router import MoRLlamaDecoderLayer
-                
-        # warmup_step for balancing
-        bal_warmup_step = 0
-        if "bal_warmup_step" in cfg.mor.token and cfg.mor.token.bal_warmup_step > 0:
-            bal_warmup_step = cfg.mor.token.bal_warmup_step * cfg.gradient_accumulation_steps
-        
-        sharing = cfg.recursive.sharing
-        num_recursion = cfg.recursive.num_recursion        
-        num_hidden_layers = len(self.model.layers)
-        
-        # Cycle sharing is for early-exiting mechanism
-        if sharing == "cycle":
-            base_depth = num_hidden_layers // num_recursion
-            self.model.layers = MoRLlamaDecoderLayer(
-                self.config,
-                nn.ModuleList([nn.ModuleList([self.model.layers[layer_idx + recur_idx * base_depth] for layer_idx in range(base_depth)]) for recur_idx in range(num_recursion)]),
-                cfg,
-                bal_warmup_step,
-            )
-        elif sharing == "middle_cycle":
-            base_depth = (num_hidden_layers - 2) // num_recursion
-            self.model.layers = nn.ModuleList(
-                [self.model.layers[0]] + \
-                [MoRLlamaDecoderLayer(
-                    self.config,
-                    nn.ModuleList([nn.ModuleList([self.model.layers[1 + layer_idx + recur_idx * base_depth] for layer_idx in range(base_depth)]) for recur_idx in range(num_recursion)]),
-                    cfg,
-                    bal_warmup_step,
-                ),] + \
-                [self.model.layers[-1]]
-            )
-    
+
+        warmup = cfg.mor.token.get("bal_warmup_step", 0) or 0
+        if warmup:
+            warmup *= cfg.gradient_accumulation_steps
+
+        def wrap_group(stages):
+            return [MoRLlamaDecoderLayer(self.config, nn.ModuleList(stages), cfg, warmup)]
+
+        self._wrap_recursions(cfg, wrap_group)
+
     def set_kv_sharing_config(self, cfg):
         if cfg.kv_sharing.sharing in ["cycle", "sequence"]:
             base_depth = self.config.num_hidden_layers // cfg.kv_sharing.num_recursion
-        elif cfg.kv_sharing.sharing in ["middle_cycle"]:
+        elif cfg.kv_sharing.sharing in ["middle_cycle", "middle_sequence"]:
             base_depth = (self.config.num_hidden_layers - 2) // cfg.kv_sharing.num_recursion
         
         if "kv_sharing" in cfg:                

@@ -30,7 +30,7 @@ from model.util import load_model_from_config
 from model.sharing_strategy import SHARING_STRATEGY
 from model.relaxation.util import relax_weight_sharing
 from util.tokenizer import load_tokenizer_from_config
-from util.config import preprocess_config
+from util.config import preprocess_config, training_config_path
 from util.misc import get_torch_dtype, get_latest_checkpoint_path
 
 # LM_DATASETS definition (same as in the original code)
@@ -107,7 +107,7 @@ def evaluate_model(exp_name: str, global_sample_number: int) -> Optional[float]:
     Returns the average loss if successful, None otherwise.
     """
     print(f"Evaluating experiment: {exp_name}")
-    cfg_path = os.path.join(PROJECT_ROOT, "conf/pretrain", f"{exp_name}.yaml")
+    cfg_path = training_config_path(os.path.join(SAVE_DIR, "pretrain", exp_name), "conf/pretrain")
     if not os.path.exists(cfg_path):
         print(f"Configuration file not found for {exp_name} at {cfg_path}. Skipping.")
         return None

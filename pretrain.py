@@ -2,6 +2,7 @@ import os
 os.environ["HYDRA_FULL_ERROR"] = "1"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 from paths import SAVE_DIR, PROJECT_ROOT, HF_CACHE_DIR; os.environ["HF_HOME"] = HF_CACHE_DIR
+import json
 import string
 import warnings
 from pathlib import Path
@@ -13,7 +14,7 @@ import torch.nn as nn
 import torch.distributed as dist
 from omegaconf import DictConfig, OmegaConf 
 from copy import deepcopy
-from transformers import TrainingArguments, Trainer
+from transformers import TrainingArguments, Trainer, set_seed
 from accelerate import Accelerator
 
 from lm_dataset.load_dataset import LM_DATASETS, load_dataset_from_config 
@@ -22,14 +23,23 @@ from model.sharing_strategy import SHARING_STRATEGY
 from model.relaxation.util import relax_weight_sharing
 from util.config import preprocess_config
 from util.tokenizer import load_tokenizer_from_config 
-from util.trainer_pt import MoRTrainer
+from util.trainer_pt import MoRTrainer, RecursiveTrainer
 from util.callback import FixedStoppingCallback, EvalCallback, PeftSaveCallback, DatasetSaveCallback, ScalingLawsSaveCallback
 from util.misc import print_trainable_parameters, get_latest_checkpoint_path, print_rank_zero, get_launcher_type; print_rank_zero()
 
 
 @hydra.main(config_path="conf/pretrain", config_name="yymmdd_pretrain")
 def main(cfg: DictConfig):
+    residual = cfg.recursive.get("residual")
+    if residual is not None:
+        # Capture CLI overrides before preprocessing derives batch sizes and paths.
+        experiment_config = OmegaConf.to_yaml(cfg, resolve=True)
+        set_seed(cfg.get("seed", 42))
     cfg = preprocess_config(cfg)
+    if residual is not None and int(os.environ.get("RANK", 0)) == 0:
+        run_dir = Path(SAVE_DIR, "pretrain", cfg.output_dir)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "training_config.yaml").write_text(experiment_config)
     
     if cfg.wandb and cfg.get("wandb_run_id") is None:
         characters = string.ascii_letters + string.digits
@@ -100,7 +110,15 @@ def main(cfg: DictConfig):
     if cfg.tensorboard:
         report_to.append("tensorboard")
     
+    ds_config = cfg.deepspeed if launcher_type == "deepspeed" else None
+    if ds_config and residual is not None:
+        # ZeRO wraps the Trainer's grouped AdamW. A DeepSpeed-owned optimizer
+        # would put the gates back into the backbone's weight-decayed group.
+        with open(ds_config) as f:
+            ds_config = json.load(f)
+        ds_config.pop("optimizer", None)
     train_args = TrainingArguments(
+        seed=cfg.get("seed", 42),
         lr_scheduler_type=cfg.get("lr_scheduler_type", "cosine_with_min_lr"),
         lr_scheduler_kwargs=dict(cfg.get("lr_scheduler_kwargs", {"min_lr_rate": 0.1,})),
         learning_rate=cfg.learning_rate,
@@ -114,9 +132,11 @@ def main(cfg: DictConfig):
         logging_steps=cfg.logging_steps,
         save_steps=cfg.save_steps,
         save_total_limit=cfg.save_total_limit,
-        save_safetensors=False if launcher_type == "accelerate" else True,
+        save_safetensors=launcher_type != "accelerate" and residual is None,
         gradient_accumulation_steps=cfg.gradient_accumulation_steps,
         gradient_checkpointing=cfg.gradient_checkpointing,
+        gradient_checkpointing_kwargs={"use_reentrant": False} if residual is not None else None,
+        ddp_find_unused_parameters=True if residual is not None and cfg.get("mor", {}).get("enable") else None,
         max_grad_norm=cfg.max_grad_norm,
         dataloader_num_workers=cfg.dataloader_num_workers,
         bf16=cfg.precision == "bf16",
@@ -125,7 +145,7 @@ def main(cfg: DictConfig):
         report_to=report_to,
         run_name=cfg.wandb_run_name,
         logging_dir=cfg.tensorboard_dir,
-        deepspeed=cfg.deepspeed if launcher_type == "deepspeed" else None,
+        deepspeed=ds_config,
         log_on_each_node=False,
     )
     
@@ -145,7 +165,8 @@ def main(cfg: DictConfig):
     if "mor" in cfg and cfg.mor.get("enable"):
         trainer = MoRTrainer(model=model, args=train_args, train_dataset=train_dataset, callbacks=callbacks, cfg=cfg,)
     else:
-        trainer = Trainer(model=model, args=train_args, train_dataset=train_dataset, callbacks=callbacks,)
+        trainer_cls = RecursiveTrainer if residual is not None and residual.mode == "rezero" else Trainer
+        trainer = trainer_cls(model=model, args=train_args, train_dataset=train_dataset, callbacks=callbacks,)
     
     train_result = trainer.train(
         resume_from_checkpoint=cfg.resume_from_checkpoint

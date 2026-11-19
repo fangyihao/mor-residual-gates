@@ -33,7 +33,7 @@ from lm_eval.api.registry import get_model
 from lm_eval.utils import handle_non_serializable, make_table, simple_parse_args_string
 from model.util import MODEL_CLS, RECURSIVE_MODEL_CLS, MOR_MODEL_CLS
 from util.tokenizer import load_tokenizer_from_config
-from util.config import overwrite_eval_config
+from util.config import overwrite_eval_config, training_config_path
 from util.misc import convert_to_serializable, print_rank_zero; print_rank_zero()
 
 
@@ -119,7 +119,7 @@ def evaluate_model(cfg: DictConfig, eval_logger=None, writer=None, step=None):
         print("Preparing evaluation of Recursive Transformer")
         assert cfg.model_args, "Must specify --model_args"
         
-        train_cfg_path = os.path.join(PROJECT_ROOT, cfg.train_cfg_fpath, f"{cfg.model_name_or_path.split('/')[-1]}.yaml")
+        train_cfg_path = training_config_path(os.path.join(SAVE_DIR, cfg.model_name_or_path), cfg.train_cfg_fpath)
         if os.path.exists(train_cfg_path):
             # in case of pretrained model, they need tokenizer config files
             tokenizer = load_tokenizer_from_config(cfg)
@@ -207,15 +207,18 @@ def evaluate_model(cfg: DictConfig, eval_logger=None, writer=None, step=None):
                             raise ValueError(f"Config key {k} not found in model config.")
                         print(f" {k}: {v}")
                         setattr(config, k, v)
-                model =  model_cls._from_config(
+                model = model_cls._from_config(
                     config, attn_implementation=attn_implementation, torch_dtype=torch_dtype,)
+                if cfg.recursive.get("residual") is not None:
+                    from model.sharing_strategy import SHARING_STRATEGY
+                    model, _ = SHARING_STRATEGY[cfg.model_arch](cfg, model)
                         
                 if cfg.mor.type == "expert":
                     model.transform_layer_to_mor_expert(cfg)
                 elif cfg.mor.type == "token":
                     model.transform_layer_to_mor_token(cfg)
                 
-                state_dict = torch.load(os.path.join(cfg.model_args.split("=")[1], "pytorch_model.bin"))
+                state_dict = torch.load(os.path.join(cfg.model_args.split("=")[1], "pytorch_model.bin"), map_location="cpu")
                 model.load_state_dict(state_dict)
                 
             else:                       

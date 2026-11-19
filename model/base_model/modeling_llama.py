@@ -303,6 +303,7 @@ class LlamaDecoderLayer(nn.Module):
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+        block_input = hidden_states
         residual = hidden_states
 
         hidden_states = self.input_layernorm(hidden_states)
@@ -326,6 +327,12 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
+
+        gate = getattr(self, "recursive_gate", None)
+        if gate is not None:
+            if isinstance(gate, torch.Tensor):
+                gate = gate.to(block_input.dtype)
+            hidden_states = torch.lerp(block_input, hidden_states, gate)
 
         outputs = (hidden_states,)
         if output_attentions:

@@ -41,6 +41,7 @@ from model.base_model.modeling_llama import (
     repeat_kv,
     eager_attention_forward,
 )
+from model.recursive_residual import install_residual_layers
 from model.kv_caches.cache_utils import Cache, StaticCache, DynamicCache, RecursiveDynamicCache
 
 logger = logging.get_logger(__name__)
@@ -69,6 +70,8 @@ class LlamaModel(LlamaPreTrainedModel):
         self.layers = nn.ModuleList(
             [LlamaDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
+        if getattr(config, "recursive_residual", None):
+            install_residual_layers(self.layers, config.recursive_residual)
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = LlamaRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
@@ -334,7 +337,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
     def set_kv_sharing_config(self, cfg):
         if cfg.kv_sharing.sharing in ["cycle", "sequence"]:
             base_depth = self.config.num_hidden_layers // cfg.kv_sharing.num_recursion
-        elif cfg.kv_sharing.sharing in ["middle_cycle"]:
+        elif cfg.kv_sharing.sharing in ["middle_cycle", "middle_sequence"]:
             base_depth = (self.config.num_hidden_layers - 2) // cfg.kv_sharing.num_recursion
         
         if "kv_sharing" in cfg:                

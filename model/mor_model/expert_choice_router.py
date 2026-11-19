@@ -11,7 +11,7 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.utils import logging
 
 from model.kv_caches.cache_utils import Cache, StaticCache, DynamicCache
-from model.mor_model.util import ROUTER_TYPES, MoRLayerOutputWithPast
+from model.mor_model.util import ROUTER_TYPES, MoRLayerOutputWithPast, run_decoder_block
 from model.base_model.modeling_llama import apply_rotary_pos_emb, eager_attention_forward, LlamaAttention
 from util.misc import get_torch_dtype
 
@@ -88,6 +88,7 @@ class MoRLlamaDecoderLayer(nn.Module):
         self.config = config
         self.block = block
         self.cfg = cfg
+        self.residual_recursion = cfg.recursive.get("residual") is not None
         self.capacity_factor = capacity_factor
         self.cap_warmup_step = cap_warmup_step  # warm_up step for capacity_factor
         
@@ -134,6 +135,7 @@ class MoRLlamaDecoderLayer(nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         prev_selected_tokens: Optional[torch.LongTensor] = None,
+        checkpoint_block=None,
         **kwargs: Unpack[FlashAttentionKwargs]
     ):          
         total_x = x
@@ -233,10 +235,13 @@ class MoRLlamaDecoderLayer(nn.Module):
         """STEP 4: forward block"""     
         if "kv_sharing" in self.cfg and self.cfg.kv_sharing.enable:
             top_k_tokens = total_x.clone()
+            if self.residual_recursion:
+                active = torch.zeros_like(total_x[:, :, :1], dtype=torch.bool)
+                active.scatter_(1, selected_tokens, True)
                 
             for blk in self.block:
-                outputs = blk(
-                    top_k_tokens,
+                outputs = run_decoder_block(
+                    blk, top_k_tokens, checkpoint_block,
                     attention_mask=attention_mask,
                     position_ids=position_ids,
                     past_key_value=past_key_value,
@@ -246,8 +251,8 @@ class MoRLlamaDecoderLayer(nn.Module):
                     position_embeddings=position_embeddings,
                     **kwargs
                 )
-                top_k_tokens = outputs[0]
-            top_k_tokens_processed = torch.gather(outputs[0], dim=1, index=indices_expanded)
+                top_k_tokens = torch.where(active, outputs[0], top_k_tokens) if self.residual_recursion else outputs[0]
+            top_k_tokens_processed = torch.gather(top_k_tokens, dim=1, index=indices_expanded)
             
         else:
             if attention_mask is not None: 
@@ -256,6 +261,8 @@ class MoRLlamaDecoderLayer(nn.Module):
                     mask_rows_selected = torch.gather(attention_mask, 2, row_indices)
                     col_indices = selected_tokens.unsqueeze(1).transpose(2, 3).expand(bs, 1, top_k, top_k)
                     attention_mask = torch.gather(mask_rows_selected, 3, col_indices)
+                elif attention_mask.dim() == 2 and self.residual_recursion:
+                    attention_mask = attention_mask.gather(1, selected_tokens.squeeze(-1))
                 elif attention_mask.dim() == 2: # TODO
                     raise NotImplementedError("Attention mask is not implemented for inference phase of MoR")
                 else: 
@@ -271,8 +278,8 @@ class MoRLlamaDecoderLayer(nn.Module):
                 cache_position = torch.gather(cache_position.expand(bs, -1), dim=1, index=selected_tokens.squeeze(-1)) 
                 
             for blk in self.block:
-                outputs = blk(
-                    top_k_tokens,
+                outputs = run_decoder_block(
+                    blk, top_k_tokens, checkpoint_block,
                     attention_mask=attention_mask,
                     position_ids=position_ids,
                     past_key_value=past_key_value,
@@ -286,14 +293,18 @@ class MoRLlamaDecoderLayer(nn.Module):
             top_k_tokens_processed = outputs[0]
             
         """STEP 5: combine results"""
-        _src = top_k_tokens_processed * weights if self.cfg.mor.expert.get("gating", "weighted") == "weighted" else top_k_tokens_processed
-        total_x = torch.scatter_add(
-            total_x,
-            dim=1,
-            index=indices_expanded,
-            src=_src,
-        )
-        
+        if self.residual_recursion:
+            # Blocks already returned x + gate * (F(x) - x).
+            total_x = total_x.scatter(1, indices_expanded, top_k_tokens_processed)
+        else:
+            _src = top_k_tokens_processed * weights if self.cfg.mor.expert.get("gating", "weighted") == "weighted" else top_k_tokens_processed
+            total_x = torch.scatter_add(
+                total_x,
+                dim=1,
+                index=indices_expanded,
+                src=_src,
+            )
+
         if self.training and "z_loss" in self.cfg.mor and self.cfg.mor.z_loss:            
             router_z_loss = torch.logsumexp(_router_weights, dim=-1)
             router_z_loss = torch.square(router_z_loss)
