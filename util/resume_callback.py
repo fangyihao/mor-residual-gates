@@ -7,11 +7,11 @@ from transformers import TrainerCallback
 from transformers.trainer_utils import rotate_checkpoints
 
 from lm_dataset.language_modeling_dataset import LanguageModelingDataset
-from util.resume import checkpoint_step
+from util.resume import checkpoint_step, preserve_ablation_weights, weights_at_step
 
 
 class ResumeCallback(TrainerCallback):
-    def __init__(self, trainer, checkpoint):
+    def __init__(self, trainer, checkpoint, ablation_step=None):
         self.trainer = trainer
         args = trainer.args
         self.dataset = trainer.train_dataset
@@ -43,6 +43,12 @@ class ResumeCallback(TrainerCallback):
                 args.ignore_data_skip = True
                 self.restore_rng = str(path)
                 self.direct_resume = True
+        self.ablation_step = ablation_step
+        if ablation_step and checkpoint and checkpoint_step(Path(checkpoint)) >= ablation_step:
+            directory = Path(args.output_dir)
+            source = weights_at_step(directory, ablation_step)
+            if trainer.is_world_process_zero():
+                preserve_ablation_weights(directory, source, ablation_step)
         self.keep = args.save_total_limit
 
     def on_step_begin(self, args, state, control, **kwargs):
@@ -61,6 +67,8 @@ class ResumeCallback(TrainerCallback):
             state.epoch = state.global_step / state.max_steps
         if self.packed and state.is_world_process_zero:
             self.dataset.commit_position(self.consumed(state.global_step))
+        if state.global_step == self.ablation_step:
+            control.should_save = True
         if control.should_save:
             # Close partial log intervals and retain the last good checkpoint until commit.
             control.should_log = True
@@ -86,6 +94,8 @@ class ResumeCallback(TrainerCallback):
             temporary = directory / "resume.tmp"
             temporary.write_text(json.dumps(manifest, indent=2))
             temporary.replace(directory / "resume.json")
+            if state.global_step == self.ablation_step:
+                preserve_ablation_weights(Path(args.output_dir), directory, self.ablation_step)
             (directory / ".saving").unlink(missing_ok=True)
             if self.keep:
                 rotate_checkpoints(output_dir=args.output_dir, save_total_limit=self.keep,

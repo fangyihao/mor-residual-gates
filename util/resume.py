@@ -1,5 +1,7 @@
 """Select committed training checkpoints and resolve evaluation weights."""
 import json
+import shutil
+import tempfile
 from pathlib import Path
 import warnings
 
@@ -9,7 +11,7 @@ from omegaconf import OmegaConf
 def same_recipe(saved, requested):
     def recipe(cfg):
         values = OmegaConf.to_container(cfg, resolve=True)
-        for key in ("auto_resume", "resume_from_checkpoint", "resume_step", "stop_steps"):
+        for key in ("auto_resume", "resume_from_checkpoint", "resume_step", "stop_steps", "ablation_checkpoint_step"):
             values.pop(key, None)
         return values
     return recipe(saved) == recipe(requested)
@@ -100,3 +102,42 @@ def evaluation_weights(directory):
     if has_weights(directory):
         return directory
     raise FileNotFoundError(f"No saved evaluation weights in {directory}")
+
+
+def weights_at_step(directory, step):
+    """Return only an evaluation snapshot, committed checkpoint or final export at this step."""
+    snapshot = directory / f"ablation-step-{step}"
+    checkpoint = directory / f"checkpoint-{step}"
+    for path in (snapshot, checkpoint, directory):
+        if path == checkpoint and not complete_checkpoint(path):
+            continue
+        try:
+            if has_weights(path) and checkpoint_step(path) == step:
+                return path
+        except (OSError, ValueError, KeyError):
+            continue
+    raise FileNotFoundError(f"No saved weights at optimizer step {step} in {directory}")
+
+
+def preserve_ablation_weights(directory, source, step):
+    """Publish evaluation weights outside Trainer's rotating checkpoint directories."""
+    snapshot = directory / f"ablation-step-{step}"
+    if source == snapshot:
+        return
+    if not has_weights(source) or checkpoint_step(source) != step:
+        raise ValueError(f"Expected evaluation weights from step {step} in {source}")
+    files = [*weight_files(source), *source.glob("*.index.json"), source / "trainer_state.json"]
+    with tempfile.TemporaryDirectory(dir=directory, prefix=".ablation-") as temp:
+        staging = Path(temp) / "weights"
+        staging.mkdir()
+        for file in files:
+            target = staging / file.relative_to(source)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            # A final export or retried checkpoint can overwrite a file in place.
+            # Keep the snapshot independent of mutable files in either source.
+            shutil.copyfile(file, target)
+        if snapshot.exists():
+            if has_weights(snapshot) and checkpoint_step(snapshot) == step:
+                return
+            raise ValueError(f"Existing ablation snapshot is incomplete: {snapshot}")
+        staging.rename(snapshot)

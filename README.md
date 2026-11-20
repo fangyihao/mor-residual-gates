@@ -93,6 +93,27 @@ bash scripts/pretrain.sh accelerate offline 0,1 all -- --seeds 1234,1235 --sampl
 
 Use `--train-only` to stop after training. Shared Hydra overrides such as `recursive.num_recursion=4` or `recursive.residual.lambda_r=0.5` apply to every run. On the GPU launcher, pass suite options and Hydra overrides after `--`. On multiple Ascend hosts, run the same command on each host with its usual rendezvous settings.
 
+#### Shorter ablations at a matched training step
+
+Use `--ablation-steps S` to compare all five methods after **S optimizer updates**. The proposed `rezero` and the stage-shared control `rezero_stage` then continue to the original full budget. The three fixed schedules stop at S. All five follow the same learning-rate schedule through S, including the original warmup and decay horizon. Gradient accumulation, seeds, training data and held-out evaluation samples follow the shared suite settings.
+
+```bash
+# Default preset, three paired seeds, two full-length runs per seed
+bash scripts/run_npu.sh all 0,1,2,3,4,5,6,7 --ablation-steps 3540 name=short_ablation
+
+# Re-score the saved checkpoints at both budgets
+bash scripts/run_npu.sh all 0,1,2,3,4,5,6,7 --ablation-steps 3540 name=short_ablation --eval-only
+
+# Use full-strength MoR as the full-budget control on two GPUs
+bash scripts/pretrain.sh accelerate offline 0,1 all -- --ablation-steps 3540 --full-budget-control full name=mor_control
+```
+
+With the preset’s 14,161-step full budget, this example uses **38,942 optimizer updates per seed**, compared with 70,805 for five full runs, a reduction of approximately 45%. Actual accelerator time depends on routing and device throughput. Choose S before inspecting held-out results. `--full-budget-control` accepts `rezero_stage`, `full`, `uniform`, `power`, or `none`. Choosing `none` stops all four controls at S. A shared `stop_steps` override sets the full-run endpoint up to `num_train_steps`. S must be smaller than that endpoint.
+
+The default outputs in the example are `residual_suite_fineweb.step-3540.json` (five methods) and `residual_suite_fineweb.full-step-14161.json` (two methods). With `--output-file pilot.json`, the files are `pilot.json` and `pilot.full-step-14161.json`. Console output includes checkpoint steps, per-seed NLL differences and, when tracking is enabled, input tokens and executed token-layers. With at least two paired seeds it reports the mean and sample standard deviation of the paired differences. A weights-only `ablation-step-S/` snapshot survives ordinary checkpoint rotation, including `save_total_limit=1`. Resume and evaluation-only commands use the same suite arguments and training overrides. Changed budgets can reuse an exact saved checkpoint. A run that has passed S without retaining it requires a different saved comparison step or a fresh run.
+
+For a paper, report the five-way comparison at S and the paired full-budget comparison in separate rows or tables. Report variability across seeds and the observed token-layer work. The short run tests how much a design helps by S. For a claim about the benefit of layer-specific gates at the end of training, use the full-budget layer-specific versus stage-shared pair. For a full-budget claim against original MoR, select `--full-budget-control full`. [NeurIPS guidance on empirical claims and reporting](https://neurips.cc/public/guides/PaperChecklist)
+
 The preset gives each mode and seed its own checkpoint directory. A literal `name=pilot` or `output_dir=pilot` becomes a prefix, for example `pilot_rezero_stage_seed1234`. Use the same prefix and seeds on restart.
 
 ```bash

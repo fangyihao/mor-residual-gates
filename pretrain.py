@@ -202,7 +202,7 @@ def main(cfg: DictConfig):
         trainer = trainer_cls(model=model, args=train_args, train_dataset=train_dataset, callbacks=callbacks,)
     
     if residual is not None:
-        trainer.add_callback(ResumeCallback(trainer, cfg.resume_from_checkpoint))
+        trainer.add_callback(ResumeCallback(trainer, cfg.resume_from_checkpoint, cfg.get("ablation_checkpoint_step")))
 
     train_result = trainer.train(
         resume_from_checkpoint=cfg.resume_from_checkpoint

@@ -60,7 +60,7 @@ if "evaluate_fineweb_test.py" in args:
     names = args[args.index("--exp_names") + 1:args.index("--sample_number")]
     path = Path(args[args.index("--output_file") + 1])
     path.write_text(json.dumps(dict.fromkeys(names, 3.0)))
-    for name in names:
+    for name in ([] if "--checkpoint-dirs" in args else names):
         run = Path("results/pretrain") / name
         run.mkdir(parents=True, exist_ok=True)
         (run / "model.safetensors").write_bytes(b"weights")
@@ -158,3 +158,65 @@ def test_eval_only_missing_and_exclusive(launch):
     for options in (["--eval-only", "seed=2"], ["--eval-only", "--train-only"]):
         result, calls = launch("npu", options)
         assert result.returncode != 0 and not calls
+
+
+@pytest.mark.parametrize("control,long_modes", [(None, {"rezero", "rezero_stage"}), ("none", {"rezero"}),
+                                               ("full", {"rezero", "full"})])
+def test_ablation_budget_preserves_schedule(control, long_modes):
+    from scripts.run_residual_suite import training_target
+
+    runs = plan("recursive_residual", ["num_train_steps=1200", "stop_steps=900"], [17, 18], 300, control)
+    for run in runs:
+        assert run.config.num_train_steps == 1200
+        assert run.config.ablation_checkpoint_step == 300
+        assert training_target(run.config) == (900 if run.mode in long_modes else 300)
+        with initialize_config_dir(config_dir=str(ROOT / "conf/pretrain"), version_base=None):
+            assert compose("recursive_residual", overrides=run.overrides) == run.config
+
+
+@pytest.mark.parametrize("steps", [-1, 0, 8, 9])
+def test_invalid_ablation_budget(steps):
+    with pytest.raises(ValueError, match="full training target"):
+        plan("recursive_residual", ["num_train_steps=12", "stop_steps=8"], [1], steps)
+    with pytest.raises(ValueError, match="requires --ablation-steps"):
+        plan("recursive_residual", [], [1], full_budget_control="full")
+
+
+def test_matched_evaluation_only(launch):
+    from omegaconf import OmegaConf
+
+    args = ["name=pilot", "seed=19", "num_train_steps=12", "stop_steps=11"]
+    runs = plan("recursive_residual", [*args, "attn_implementation=sdpa"], None, 4)
+    for run in runs:
+        directory = launch.repo / "results/pretrain" / run.directory
+        snapshot = directory / "ablation-step-4"
+        snapshot.mkdir(parents=True)
+        OmegaConf.save(run.config, directory / "training_config.yaml", resolve=True)
+        (snapshot / "model.safetensors").write_bytes(b"step 4")
+        (snapshot / "trainer_state.json").write_text('{"global_step":4,"log_history":[]}')
+        if run.mode in ("rezero", "rezero_stage"):
+            (directory / "model.safetensors").write_bytes(b"step 11")
+            (directory / "trainer_state.json").write_text('{"global_step":11,"log_history":[]}')
+    result, calls = launch("npu", ["--eval-only", "--ablation-steps", "4", *args, "--output-file", "paper.json"])
+    assert result.returncode == 0, result.stderr
+    early, full = [argv for _, argv, _ in calls]
+    assert all("pretrain.py" not in argv for argv in (early, full))
+    assert len(early[early.index("--exp_names") + 1:early.index("--sample_number")]) == 5
+    assert len(full[full.index("--exp_names") + 1:full.index("--sample_number")]) == 2
+    assert all(Path(path).name == "ablation-step-4" for path in early[early.index("--checkpoint-dirs") + 1:-1])
+    assert full[full.index("--output_file") + 1].endswith("paper.full-step-11.json")
+
+
+def test_reject_latest_as_missing_ablation(tmp_path, monkeypatch):
+    from omegaconf import OmegaConf
+    from scripts import run_residual_suite as suite
+
+    run = plan("recursive_residual", ["name=old_suite"], [19], 12)[0]
+    monkeypatch.setattr(suite, "ROOT", tmp_path)
+    directory = tmp_path / "results/pretrain" / run.directory
+    directory.mkdir(parents=True)
+    OmegaConf.save(run.config, directory / "training_config.yaml", resolve=True)
+    (directory / "model.safetensors").write_bytes(b"step 18")
+    (directory / "trainer_state.json").write_text('{"global_step":18}')
+    with pytest.raises(ValueError, match="No saved weights at optimizer step 12"):
+        suite.completed(run)

@@ -58,3 +58,26 @@ def test_incomplete_and_truncated_saves(tmp_path):
         assert latest_checkpoint(tmp_path).name == "checkpoint-7"
     assert evaluation_weights(tmp_path).name == "checkpoint-7"
     assert not complete_checkpoint(tmp_path / "checkpoint-8")
+
+
+def test_ablation_snapshot_retains_shards_and_frozen_state(tmp_path):
+    from util.resume import preserve_ablation_weights, weights_at_step
+    from shutil import rmtree
+
+    checkpoint = tmp_path / "checkpoint-3"
+    checkpoint.mkdir()
+    shards = ["model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"]
+    for f in shards:
+        (checkpoint / f).write_bytes(f.encode())
+    (checkpoint / "model.safetensors.index.json").write_text(json.dumps({"weight_map": dict(zip("ab", shards))}))
+    (checkpoint / "trainer_state.json").write_text('{"global_step":3}')
+    (checkpoint / "optimizer.pt").write_bytes(b"optimizer")
+    preserve_ablation_weights(tmp_path, checkpoint, 3)
+    (checkpoint / shards[0]).write_bytes(b"changed")
+    rmtree(checkpoint)
+    snapshot = weights_at_step(tmp_path, 3)
+    assert (snapshot / shards[0]).read_bytes() == shards[0].encode()
+    assert (snapshot / "model.safetensors.index.json").is_file()
+    assert not (snapshot / "optimizer.pt").exists()
+    with pytest.raises(FileNotFoundError):
+        weights_at_step(tmp_path, 4)
