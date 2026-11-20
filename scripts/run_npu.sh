@@ -2,7 +2,7 @@
 # Launch one torchrun worker per listed Ascend device on this host.
 set -eu
 usage() {
-    echo "Usage: bash scripts/run_npu.sh {train|eval|check} DEVICE_IDS [experiment arguments...]" >&2
+    echo "Usage: bash scripts/run_npu.sh {train|all|eval|check} DEVICE_IDS [experiment arguments...]" >&2
     exit 2
 }
 [[ $# -ge 2 ]] || usage
@@ -33,6 +33,7 @@ fi
 
 cd "$(dirname "$0")/.."
 case "$command" in
+    all) exec python scripts/run_residual_suite.py npu "$device_ids" "$@" ;;
     train)
         program=(pretrain.py --config-name "${CONFIG_NAME:-recursive_residual}" attn_implementation=sdpa
                  'hydra.run.dir=outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}/rank_${oc.env:RANK}')

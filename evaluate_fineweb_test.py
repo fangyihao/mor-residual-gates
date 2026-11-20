@@ -112,14 +112,14 @@ def evaluation_state():
     return PartialState(cpu=not torch.cuda.is_available())
 
 
-def evaluate_model(exp_name: str, global_sample_number: int, state=None, attn_implementation=None) -> Optional[float]:
+def evaluate_model(exp_name: str, global_sample_number: int, state=None, attn_implementation=None, strict=False) -> Optional[float]:
     """Score the same packed sample prefix for any number of data-parallel workers."""
     if state is None:
         state = evaluation_state()
     print(f"Evaluating experiment: {exp_name}")
     cfg_path = training_config_path(os.path.join(SAVE_DIR, "pretrain", exp_name), "conf/pretrain")
     if not os.path.exists(cfg_path):
-        if state.num_processes > 1:
+        if strict or state.num_processes > 1:
             raise FileNotFoundError(cfg_path)
         print(f"Configuration file not found for {exp_name} at {cfg_path}. Skipping.")
         return None
@@ -167,7 +167,7 @@ def evaluate_model(exp_name: str, global_sample_number: int, state=None, attn_im
         load_model_weights(model, checkpoint_dir)
         print(f"Loaded experiment weights from {checkpoint_dir}")
     except (FileNotFoundError, RuntimeError) as exc:
-        if state.num_processes > 1:
+        if strict or state.num_processes > 1:
             raise
         warnings.warn(f"Skipping {exp_name}: {exc}")
         del model
@@ -204,7 +204,7 @@ def evaluate_model(exp_name: str, global_sample_number: int, state=None, attn_im
                 total_loss += output.loss.float()
                 evaluated_samples += 1
             except Exception as exc:
-                if state.num_processes > 1:
+                if strict or state.num_processes > 1:
                     raise
                 warnings.warn(f"Error scoring a sample for {exp_name}: {exc}")
     count = torch.tensor(evaluated_samples, device=device, dtype=torch.long)
@@ -212,9 +212,13 @@ def evaluate_model(exp_name: str, global_sample_number: int, state=None, attn_im
         torch.distributed.all_reduce(total_loss)
         torch.distributed.all_reduce(count)
     count = count.item()
+    if strict and count != global_sample_number:
+        raise ValueError(f"{exp_name} scored {count} of {global_sample_number} requested samples")
     if count == 0:
         return None
     avg_loss = total_loss.item() / count
+    if strict and not math.isfinite(avg_loss):
+        raise ValueError(f"{exp_name} produced non-finite FineWeb loss {avg_loss}")
     if state.is_main_process:
         print(f"Experiment: {exp_name}, fineweb_test loss ({count} samples): {avg_loss:.4f}")
     return avg_loss
@@ -243,9 +247,12 @@ def main():
     )
 
     parser.add_argument("--attn_implementation", choices=("eager", "sdpa", "flash_attention_2"))
+    parser.add_argument("--strict", action="store_true", help="require a finite loss on every requested sample")
     args = parser.parse_args()
     if args.sample_number < 0:
         parser.error("--sample_number must be nonnegative")
+    if args.strict and args.sample_number == 0:
+        parser.error("--strict requires at least one sample")
     state = evaluation_state()
     experiment_names = args.exp_names
     global_sample_number = args.sample_number
@@ -261,7 +268,7 @@ def main():
     all_results: Dict[str, Optional[float]] = {} # Initialize dictionary to store all results
 
     for exp_name in experiment_names:
-        loss = evaluate_model(exp_name, global_sample_number, state, args.attn_implementation)
+        loss = evaluate_model(exp_name, global_sample_number, state, args.attn_implementation, args.strict)
         all_results[exp_name] = loss # loss can be float or None
         print("-" * 70)
 
@@ -274,6 +281,8 @@ def main():
             json.dump(all_results, f, indent=4)
         print(f"Evaluation results saved to {output_file_path}")
     except IOError as e:
+        if args.strict:
+            raise
         print(f"Error saving results to JSON file {output_file_path}: {e}")
 
     print("\nSummary of results:")

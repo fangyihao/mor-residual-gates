@@ -45,14 +45,10 @@ for model in ("HuggingFaceTB/SmolLM-135M", "HuggingFaceTB/SmolLM2-135M"):
 PY
 ```
 
-The single-GPU example below uses the same pretrained weights, seed, router, $K=3$, data, and learning rate for all five experiments. To run only the proposal, use `rezero` as the sole mode.
+To train the proposed layer-specific gates on a single GPU with the preset defaults, run:
 
 ```bash
-for mode in rezero rezero_stage full uniform power; do
-    accelerate launch --config_file acc_configs/single_gpu_config.yaml \
-        pretrain.py --config-name recursive_residual \
-        recursive.residual.mode="$mode" || break
-done
+bash scripts/pretrain.sh accelerate offline 0 recursive_residual
 ```
 
 Set `recursive.num_recursion`, `recursive.residual.lambda_r` and `recursive.residual.zeta` on the command line to change the schedules. Supply a distinct `name=...` when sweeping coefficients at the same mode and seed, since the training entry point resumes existing run directories. Each run saves its resolved input configuration next to its checkpoints. For the default proposal, evaluate held-out FineWeb loss with this command.
@@ -73,6 +69,33 @@ model = MoRLlamaForCausalLM.from_pretrained(
 
 Run the CPU regression suite with `python -m pytest -q tests/test_recursive_residual.py`. It uses tiny local Llama checkpoints to test pretrained preservation, sparse routing, signed gates, fixed coefficients, checkpoint restoration, and optimizer grouping.
 
+
+### Run all five experiments
+
+The `all` option trains `rezero`, `rezero_stage`, `full`, `uniform` and `power` sequentially for each of three paired seeds (1234, 1235 and 1236). The default suite uses $K=8$, gradient checkpointing and token-layer tracking. After all 15 training runs finish, it evaluates every checkpoint on the same 200 packed FineWeb samples. A failed run stops the suite and returns a nonzero exit status.
+
+```bash
+# Eight Ascend NPUs
+bash scripts/run_npu.sh all 0,1,2,3,4,5,6,7
+
+# Two GPUs with Accelerate
+bash scripts/pretrain.sh accelerate offline 0,1 all
+
+# One seed, five runs, with a custom checkpoint prefix
+bash scripts/run_npu.sh all 0,1,2,3,4,5,6,7 --seeds 1234 name=pilot
+
+# Train all five modes at the original single-GPU preset depth and seed
+bash scripts/pretrain.sh accelerate offline 0 all -- seed=1234 recursive.num_recursion=3 --train-only
+
+# Two paired seeds on GPUs, with a larger evaluation set
+bash scripts/pretrain.sh accelerate offline 0,1 all -- --seeds 1234,1235 --sample-number 500
+```
+
+Use `--train-only` to stop after training. Shared Hydra overrides such as `recursive.num_recursion=4` or `recursive.residual.lambda_r=0.5` apply to every run. On the GPU launcher, pass suite options and Hydra overrides after `--`. On multiple Ascend hosts, run the same command on each host with its usual rendezvous settings.
+
+The preset gives each mode and seed its own checkpoint directory. A literal `name=pilot` or `output_dir=pilot` becomes a prefix, for example `pilot_rezero_stage_seed1234`. Repeating a suite skips completed runs with matching configurations and final weights, resumes interrupted runs from their checkpoints, and includes all modes in the evaluation. Use a fresh prefix when changing the training recipe.
+
+Held-out losses are saved in `residual_suite_fineweb.json` in the repository root. Set `--output-file FILE` to choose a different path. The report prints NLL for each run, total input tokens and executed token-layers when tracking is enabled, and a paired loss difference for each seed. Negative layer-specific minus stage-shared NLL favors `rezero`. Token-layer counts include compacted-batch padding and exclude backward recomputation. Compare matched totals and use separate validation data when choosing fixed schedule coefficients.
 
 ### Paired stage-sharing comparison at $K=8$
 

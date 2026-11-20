@@ -1,4 +1,5 @@
 #!/bin/bash
+set -e
 
 launcher_type="accelerate"
 
@@ -21,7 +22,7 @@ echo "INFO: WANDB_MODE is set to '$WANDB_MODE'"
 
 # Optional Hydra overrides after -- apply to every selected preset.
 if [[ $# -lt 2 || -z "$1" || "$2" == -- ]]; then
-  echo "Usage: $0 [accelerate|deepspeed] [online|offline] GPU_IDS CONFIG [CONFIG ...] [-- HYDRA_OVERRIDE ...]" >&2
+  echo "Usage: $0 [accelerate|deepspeed] [online|offline] GPU_IDS {CONFIG [CONFIG ...]|all} [-- OPTIONS ...]" >&2
   exit 1
 fi
 gpu_numbers="$1"
@@ -35,6 +36,16 @@ done
 if [[ $# -gt 0 ]]; then
   shift
 fi
+
+for config_name in "${config_names[@]}"; do
+  if [[ "$config_name" == all ]]; then
+    if [[ ${#config_names[@]} -ne 1 ]]; then
+      echo "Use all as the sole preset and pass suite options after --." >&2
+      exit 2
+    fi
+    exec python "$(dirname "$0")/run_residual_suite.py" "$launcher_type" "$gpu_numbers" "$@"
+  fi
+done
 
 for config_name in "${config_names[@]}"; do
   # Generate a 5-digit random port.
