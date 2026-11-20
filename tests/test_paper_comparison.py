@@ -1,4 +1,4 @@
-"""The historical reference, native MoR control and locally paired measurements."""
+"""The historical reference, optional author checkpoint and locally paired ReZero measurements."""
 import json
 from types import SimpleNamespace
 
@@ -14,7 +14,7 @@ from scripts.run_residual_suite import PAPER_METHODS, ROOT, plan, training_targe
 def test_paper_recipes_and_control_budgets():
     reference = OmegaConf.to_container(OmegaConf.load(ROOT / "conf/pretrain" / (RELEASED_CONFIG + ".yaml")))
     runs = plan("paper_mor", [], [1234], 3540)
-    assert PAPER_METHODS == ("original_mor", "rezero", "rezero_stage")
+    assert PAPER_METHODS == ("rezero", "rezero_stage")
     assert [r.mode for r in runs] == [*PAPER_METHODS, "uniform", "power"]
     for run in runs:
         cfg = run.config
@@ -25,10 +25,8 @@ def test_paper_recipes_and_control_budgets():
         assert not recipe_changes(cfg, reference)
         assert cfg.use_pretrained_weights is False and cfg.recursive.sharing == "middle_cycle"
         assert cfg.recursive.initialization == "random"
-        if run.mode == "original_mor":
-            assert cfg.recursive.residual is None and cfg.mor.expert.gating == "weighted"
-        else:
-            assert cfg.recursive.residual.mode == run.mode
+        assert cfg.recursive.num_recursion == 3 and cfg.recursive.residual.mode == run.mode
+        assert cfg.num_train_steps == 14161 and cfg.ablation_checkpoint_step == 3540
         assert training_target(cfg) == (14161 if run.mode in PAPER_METHODS else 3540)
     with pytest.raises(ValueError, match="full budget"):
         plan("paper_mor", [], [1234], 3540, "none")
@@ -78,16 +76,15 @@ def test_report_keeps_historical_and_paired_estimates_distinct(tmp_path):
     assert report["authors_checkpoint_rescored"]["weight_sha256"]["model.safetensors"] == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
     assert report["authors_checkpoint_rescored"]["metrics"] == {"fineweb_nll": 2.9}
     assert all(not row["released_token_budget_reached"] for row in report["local_runs"])
-    delta = report["paired_local_differences"]["rezero_stage_minus_original_mor"]
-    assert delta["summary"]["fineweb_nll"]["mean"] == pytest.approx(0.15)
+    delta = report["paired_local_differences"]["rezero_minus_rezero_stage"]
+    assert delta["summary"]["fineweb_nll"]["mean"] == pytest.approx(-0.15)
     assert delta["summary"]["fineweb_nll"]["n"] == 2
     assert "Modified recipe or training budget" in output.with_suffix(".paper.md").read_text()
-    assert set(report["paired_local_differences"]) == {
-        "rezero_minus_original_mor", "rezero_stage_minus_original_mor", "rezero_minus_rezero_stage"}
+    assert set(report["paired_local_differences"]) == {"rezero_minus_rezero_stage"}
     assert "modified training recipe or token budget" in output.with_suffix(".table3-rows.tex").read_text()
     rows = report["local_runs"]
-    next(r for r in rows if r["seed"] == 1 and r["method"] == "original_mor")["input_tokens"] = 11
-    assert paired_results(rows)["rezero_stage_minus_original_mor"]["summary"]["fineweb_nll"]["n"] == 1
+    next(r for r in rows if r["seed"] == 1 and r["method"] == "rezero_stage")["input_tokens"] = 11
+    assert paired_results(rows)["rezero_minus_rezero_stage"]["summary"]["fineweb_nll"]["n"] == 1
 
 def test_normalized_choice_uses_utf8_bytes_only_when_requested():
     from lm_eval.api.task import ConfigurableTask
@@ -129,7 +126,7 @@ def test_table3_latex_emits_only_paired_full_budget_rows(tmp_path):
              "executed_token_layers": 1000, "recipe_changes": {}, "released_token_budget_reached": True,
              "parameters": {"non_embedding": 118_000_020}, "forward_work": {"total": 17_700_000_000_000_000_000},
              "metrics": {k: (2.71 if k == "fineweb_nll" else 50) + 0.2 * seed for k in METRICS}}
-            for method in ("original_mor", *LABELS) for seed in (1, 2)]
+            for method in LABELS for seed in (1, 2)]
     report = {"local_runs": rows, "local_summary": method_summaries(rows),
               "evaluation_data": {"local": {"packed_sequences": 500}},
               "benchmark_protocol": {"local": {"n_shot": {"test": 0}}}}
@@ -147,3 +144,19 @@ def test_table3_latex_emits_only_paired_full_budget_rows(tmp_path):
     assert all(line.startswith("%") for line in path.read_text().splitlines())
     rows.pop()
     assert "same set of training seeds" in write_table3(path, report)
+
+
+def test_author_checkpoint_uses_native_architecture_without_training_a_baseline(tmp_path, monkeypatch):
+    from util.config import load_scoring_config
+
+    monkeypatch.setenv("WORLD_SIZE", "1")
+    run = plan("paper_mor", ["save_interval=null", "save_steps=1"], [1234])[0]
+    path = tmp_path / "training_config.yaml"
+    OmegaConf.save(run.config, path, resolve=True)
+    local = load_scoring_config(path)
+    native = load_scoring_config(path, native_mor=True)
+    assert local.recursive.residual.mode == "rezero"
+    assert native.recursive.residual is None and native.paper_method == "original_mor"
+    assert local.mor == native.mor and local.kv_sharing == native.kv_sharing
+    assert local.recursive.num_recursion == native.recursive.num_recursion == 3
+    assert local.model_name_or_path == native.model_name_or_path

@@ -76,11 +76,10 @@ Use `--paper-comparison` for the main experiment. It inherits the authors’ rel
 
 | Local method | What the comparison tests |
 |---|---|
-| `original_mor` | Runs the released router-weighted scatter-add update. Compare either ReZero variant with this arm for the overall method effect. |
 | `rezero` | Learns one zero-initialized scalar per physical layer and extra stage. This is the proposed method. |
 | `rezero_stage` | Shares one scalar across physical layers at each extra stage. Comparing it with `rezero` measures the value of layer specificity. |
 
-The default trains each arm on seeds 1234, 1235 and 1236 (nine full runs) with gradient checkpointing and automatic resume. Prepare the model config, tokenizer and both FineWeb datasets as described in this README. Downstream evaluation also requires access to the benchmark datasets or their local cache. The released harness includes legacy dataset loaders. Use `python -m pip install 'datasets==3.6.0'` to reproduce the loader version tested with this suite.
+The default trains the two gated methods on seeds 1234, 1235 and 1236 (six full runs) with gradient checkpointing and automatic resume. Prepare the model config, tokenizer and both FineWeb datasets as described in this README. Downstream evaluation also requires access to the benchmark datasets or their local cache. The released harness includes legacy dataset loaders. Use `python -m pip install 'datasets==3.6.0'` to reproduce the loader version tested with this suite.
 
 ```bash
 # Train and evaluate the main comparison on eight Ascend NPUs
@@ -89,21 +88,35 @@ bash scripts/run_npu.sh all 0,1,2,3,4,5,6,7 --paper-comparison
 # Equivalent suite on two GPUs
 bash scripts/pretrain.sh accelerate offline 0,1 all -- --paper-comparison
 
-# Add uniform and power controls at step 3,540 while keeping all three main arms at full length
+# Two full-budget runs and four matched early evaluations per seed
 bash scripts/run_npu.sh all 0,1,2,3,4,5,6,7 --paper-comparison --ablation-steps 3540
+
+# Run only the four short ablations; the combined command above can resume both ReZero runs later
+bash scripts/run_npu.sh all 0,1,2,3,4,5,6,7 --paper-comparison --ablation-steps 3540 --ablations-only
 
 # Score full-budget checkpoints, including a local copy of the authors’ matching native MoR weights
 bash scripts/run_npu.sh all 0,1,2,3,4,5,6,7 --paper-comparison --eval-only \
   --author-checkpoint /path/to/original-mor-360m-k3-expert-cache
 ```
 
+All paper experiments shown here use **$K=3$**, including the short ablations. A token can execute the recursive body up to three times. The first execution is ungated and stages 2 and 3 apply the selected residual rule. At the default $\Lambda_R=1$ and $\zeta=1$, uniform scaling uses $(0.5,0.5)$ and power-law scaling uses $(0.6,0.4)$.
+
+| Method | Short FineWeb evaluation | Full FineWeb and downstream evaluation |
+|---|---:|---:|
+| Layer-specific ReZero | Step 3,540 of the main run | Step 14,161 |
+| Stage-shared ReZero | Step 3,540 of the main run | Step 14,161 |
+| Uniform scaling | Step 3,540 | — |
+| Power-law scaling | Step 3,540 | — |
+
+The combined command trains four trajectories per seed. Each ReZero trajectory supplies both checkpoints. The two fixed schedules stop at the short checkpoint, using the same learning-rate schedule as ReZero through that step. Use the combined command from the start to retain the exact early checkpoint, or start with `--ablations-only` and rerun without that flag to continue the gated models. Both commands use the same run names.
+
 Repeat the original command to resume training. Use `--train-only` to defer evaluation, `--eval-only` to score saved checkpoints at the requested step, or `--nll-only` to defer downstream scoring. Repeat the same training overrides in evaluation-only mode. For a separate pilot, use a distinct `name=...` prefix. The optional authors’ checkpoint directory accepts Hugging Face safetensors or PyTorch weights, including shards. Select the fixed-FLOPs K=3 checkpoint from the authors’ release and retain its provenance. The runner records the supplied weight hashes. [Authors’ checkpoint release](https://drive.google.com/drive/folders/1pYKJOu2aBGC-jgoWbfP6T_vqEYtUVxa4?usp=drive_link)
 
-The default output `paper_mor_fineweb.paper.md` contains the reported MoR row and the local means, sample standard deviations, seed counts and measured training tokens. The adjacent `.paper.json` includes per-seed results, paired differences, trainable gate counts, executed token-layers and differences from the released training recipe. The optional shorter panel scores all five local methods at the same early step on FineWeb, and writes the downstream results and paper table at the full step. Use the full-budget paired results for end-of-training claims. The native MoR rerun calibrates the local evaluation. Its contrast with either ReZero variant measures the combined effects of the residual update and its gate. Comparing the two ReZero variants isolates gate sharing. To measure the contribution of adding a gate under identical writeback, include a fixed full-strength control in a separate ablation.
+The default output `paper_mor_fineweb.paper.md` contains the reported MoR row and the local means, sample standard deviations, seed counts and measured training tokens. The adjacent `.paper.json` includes per-seed results, paired differences, trainable gate counts, executed token-layers and differences from the released training recipe. The optional shorter panel scores all four methods at the same early step on FineWeb, and writes the downstream results and paper table at the full step. Use the full-budget paired results for end-of-training claims. The native baseline in the report is the published measurement. Optionally rescore the authors’ weights with `--author-checkpoint` to check for evaluation differences without training a baseline. Comparisons against published MoR describe the overall method difference. Comparing the two ReZero variants isolates gate sharing. To measure the contribution of adding a gate under identical writeback, include a fixed full-strength control in a separate ablation.
 
 For the main manuscript, insert `\input{paper_mor_fineweb.table3-rows.tex}` immediately before the final rule in Table 3. With shorter ablations the fragment is named after the full-step output. It appends **Layer-specific ReZero** and **Stage-shared ReZero** in the original 16-column order. The cells contain seed means, measured non-embedding parameter counts rounded to millions, and the actual training tokens in billions. Include the seed count in the caption and retain per-seed results in the supplement. A pilot, an NLL-only evaluation, missing work records or unpaired gated runs produce a comment explaining what is missing in place of publishable rows.
 
-Mark the two new rows as local measurements and attribute the historical rows to Bae et al. The asterisk in the FLOPs column identifies the local forward-only estimate in units of $10^{18}$. Suggested caption text: “Local FLOPs sum decoder, router and vocabulary projections and causal attention at the executed stage lengths. Elementwise operations, backward passes and checkpoint recomputation are excluded.” The JSON gives the components and the Markdown report shows native MoR under this same convention. Interpret comparisons with the 30B row as token-matched. Inspect the locally counted FLOPs alongside the published 16.5 before claiming matched compute. [Original forward-FLOP convention, Appendix F](https://papers.nips.cc/paper_files/paper/2025/file/8b08bbf8b420faa6eeb4020720582ec7-Paper-Conference.pdf)
+Mark the two new rows as local measurements and attribute the historical rows to Bae et al. The asterisk in the FLOPs column identifies the local forward-only estimate in units of $10^{18}$. Suggested caption text: “Local FLOPs sum decoder, router and vocabulary projections and causal attention at the executed stage lengths. Elementwise operations, backward passes and checkpoint recomputation are excluded.” The JSON gives the components for each gated model. Interpret comparisons with the 30B row as token-matched. Inspect the locally counted FLOPs alongside the published 16.5 before claiming matched compute. [Original forward-FLOP convention, Appendix F](https://papers.nips.cc/paper_files/paper/2025/file/8b08bbf8b420faa6eeb4020720582ec7-Paper-Conference.pdf)
 
 The scorer fingerprints the ordered FineWeb token IDs for the same finite prefix (500 packed sequences by default). Downstream evaluation uses LAMBADA, HellaSwag, PIQA, WinoGrande, ARC and MMLU continuation. ARC averages Easy and Challenge equally, and the overall mean gives each of the six task families equal weight. HellaSwag, PIQA and both ARC tasks use target byte-length normalization. The released task definitions resolve to zero shots by default. Appendix D does not give per-task shot counts or identify the precise held-out prefix. The report records the local shot counts, sample counts and task versions. If an evaluation setting is independently confirmed, `--benchmark-shots TASK=N` applies it to every arm, including the supplied authors’ checkpoint. Interpret paper-to-local gaps in light of this calibration. The released expert-choice router selects tokens across the sequence, so these scores describe offline held-out scoring. Claims about strictly causal decoding require a separate evaluation.
 
@@ -149,7 +162,7 @@ With the preset’s 14,161-step full budget, this example uses **38,942 optimize
 
 The default outputs in the example are `residual_suite_fineweb.step-3540.json` (five methods) and `residual_suite_fineweb.full-step-14161.json` (two methods). With `--output-file pilot.json`, the files are `pilot.json` and `pilot.full-step-14161.json`. Console output includes checkpoint steps, per-seed NLL differences and, when tracking is enabled, input tokens and executed token-layers. With at least two paired seeds it reports the mean and sample standard deviation of the paired differences. A weights-only `ablation-step-S/` snapshot survives ordinary checkpoint rotation, including `save_total_limit=1`. Resume and evaluation-only commands use the same suite arguments and training overrides. Changed budgets can reuse an exact saved checkpoint. A run that has passed S without retaining it requires a different saved comparison step or a fresh run.
 
-For a paper, report the five-way comparison at S and the paired full-budget comparison in separate rows or tables. Report variability across seeds and the observed token-layer work. The short run tests how much a design helps by S. For a claim about the benefit of layer-specific gates at the end of training, use the full-budget layer-specific versus stage-shared pair. Use the `--paper-comparison` preset above for a full-budget comparison with the original MoR update. [NeurIPS guidance on empirical claims and reporting](https://neurips.cc/public/guides/PaperChecklist)
+For a paper, report the five-way comparison at S and the paired full-budget comparison in separate rows or tables. Report variability across seeds and the observed token-layer work. The short run tests how much a design helps by S. For a claim about the benefit of layer-specific gates at the end of training, use the full-budget layer-specific versus stage-shared pair. Use the `--paper-comparison` preset above for a full-budget comparison with the published MoR reference. [NeurIPS guidance on empirical claims and reporting](https://neurips.cc/public/guides/PaperChecklist)
 
 The preset gives each mode and seed its own checkpoint directory. A literal `name=pilot` or `output_dir=pilot` becomes a prefix, for example `pilot_rezero_stage_seed1234`. Use the same prefix and seeds on restart.
 

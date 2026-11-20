@@ -49,20 +49,19 @@ def table_metrics(raw):
     return scores
 
 
-def score(directory, weights, shots):
+def score(directory, weights, shots, native_mor=False):
     from evaluate_fineweb_test import evaluation_state, load_scoring_model
     from lm_eval import evaluator
     from lm_eval.models.recursive_lm import RecursiveTransformer
     from lm_eval.tasks import TaskManager
-    from omegaconf import OmegaConf
-    from util.config import preprocess_config
+    from util.config import load_scoring_config
     from util.misc import get_torch_dtype
     from util.tokenizer import load_tokenizer_from_config
 
     state = evaluation_state()
     if state.num_processes != 1:
         raise ValueError("The paper downstream evaluator expects one process")
-    cfg = preprocess_config(OmegaConf.load(directory / "training_config.yaml"))
+    cfg = load_scoring_config(directory / "training_config.yaml", native_mor)
     if state.device.type == "npu" and cfg.attn_implementation == "flash_attention_2":
         cfg.attn_implementation = "sdpa"
     model = load_scoring_model(cfg, directory, weights).eval().to(state.device, dtype=get_torch_dtype(cfg))
@@ -84,15 +83,18 @@ def main():
     parser.add_argument("--runs", nargs="+", required=True)
     parser.add_argument("--weights", nargs="+", type=Path, required=True)
     parser.add_argument("--labels", nargs="+")
+    parser.add_argument("--native-mor-label", help="load the native MoR architecture for this external checkpoint label")
     parser.add_argument("--shots", type=shot_overrides)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     labels = args.labels or args.runs
     if len(labels) != len(args.runs) or len(set(labels)) != len(labels) or len(args.runs) != len(args.weights):
         parser.error("Pass one checkpoint per run")
+    if args.native_mor_label and args.native_mor_label not in labels:
+        parser.error("--native-mor-label must match a result label")
     results = {}
     for name, label, weights in zip(args.runs, labels, args.weights, strict=True):
-        results[label] = score(ROOT / "results/pretrain" / name, weights, args.shots)
+        results[label] = score(ROOT / "results/pretrain" / name, weights, args.shots, native_mor=label == args.native_mor_label)
         temporary = args.output.with_suffix(".tmp")
         temporary.write_text(json.dumps(results, indent=2, allow_nan=False) + "\n")
         temporary.replace(args.output)

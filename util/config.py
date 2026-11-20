@@ -142,6 +142,14 @@ def preprocess_config(cfg: DictConfig):
     return cfg
 
 
+def load_scoring_config(path, native_mor=False):
+    cfg = OmegaConf.load(path)
+    if native_mor:
+        cfg.recursive.residual = None
+        cfg.paper_method = "original_mor"
+    return preprocess_config(cfg)
+
+
 def training_config_path(run_dir, config_dir):
     saved = os.path.join(run_dir, "training_config.yaml")
     if os.path.isfile(saved):

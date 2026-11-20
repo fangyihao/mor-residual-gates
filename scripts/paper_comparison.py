@@ -39,26 +39,24 @@ def summary(values):
 
 
 def paired_results(rows):
-    by_method = {(r["seed"], r["method"]): r for r in rows}
-    comparisons = {}
-    for method, control in (("rezero", "original_mor"), ("rezero_stage", "original_mor"), ("rezero", "rezero_stage")):
-        pairs = {}
-        for row in rows:
-            if row["method"] != method:
-                continue
-            other = by_method.get((row["seed"], control))
-            if (not other or row["step"] != other["step"] or row["input_tokens"] is None
-                    or row["input_tokens"] != other["input_tokens"]):
-                continue
-            pairs[row["seed"]] = {k: v - other["metrics"][k] for k, v in row["metrics"].items() if k in other["metrics"]}
-        if pairs:
-            estimates = defaultdict(list)
-            for deltas in pairs.values():
-                for metric, value in deltas.items():
-                    estimates[metric].append(value)
-            comparisons[f"{method}_minus_{control}"] = {
-                "per_seed": pairs, "summary": {k: summary(v) for k, v in estimates.items()}}
-    return comparisons
+    shared = {r["seed"]: r for r in rows if r["method"] == "rezero_stage"}
+    pairs = {}
+    estimates = defaultdict(list)
+    for row in rows:
+        if row["method"] != "rezero":
+            continue
+        other = shared.get(row["seed"])
+        if (not other or row["step"] != other["step"] or row["input_tokens"] is None
+                or row["input_tokens"] != other["input_tokens"]):
+            continue
+        deltas = {k: v - other["metrics"][k] for k, v in row["metrics"].items() if k in other["metrics"]}
+        pairs[row["seed"]] = deltas
+        for metric, value in deltas.items():
+            estimates[metric].append(value)
+    if not pairs:
+        return {}
+    return {"rezero_minus_rezero_stage": {
+        "per_seed": pairs, "summary": {k: summary(v) for k, v in estimates.items()}}}
 
 
 def method_summaries(rows):

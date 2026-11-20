@@ -35,7 +35,7 @@ from model.util import load_model_from_config
 from model.sharing_strategy import SHARING_STRATEGY
 from model.relaxation.util import relax_weight_sharing
 from util.tokenizer import load_tokenizer_from_config
-from util.config import preprocess_config, training_config_path
+from util.config import load_scoring_config, training_config_path
 from util.misc import get_torch_dtype, get_latest_checkpoint_path
 from util.device import select_npu
 
@@ -158,7 +158,7 @@ def fingerprint_prefix(dataset, size, digest):
         yield sample
 
 
-def evaluate_model(exp_name: str, global_sample_number: int, state=None, attn_implementation=None, strict=False, latest_saved=False, weights_dir=None, data_manifest=None) -> Optional[float]:
+def evaluate_model(exp_name: str, global_sample_number: int, state=None, attn_implementation=None, strict=False, latest_saved=False, weights_dir=None, data_manifest=None, native_mor=False) -> Optional[float]:
     """Score the same packed sample prefix for any number of data-parallel workers."""
     if state is None:
         state = evaluation_state()
@@ -170,9 +170,7 @@ def evaluate_model(exp_name: str, global_sample_number: int, state=None, attn_im
         print(f"Configuration file not found for {exp_name} at {cfg_path}. Skipping.")
         return None
 
-    cfg = OmegaConf.load(cfg_path)
-    cfg = preprocess_config(cfg) # This should handle setting default max_length if not present
-
+    cfg = load_scoring_config(cfg_path, native_mor)
     cfg.resume_from_checkpoint = False
     if attn_implementation is not None:
         cfg.attn_implementation = attn_implementation
@@ -269,6 +267,7 @@ def main():
         help="Path to save the JSON file with evaluation results."
     )
 
+    parser.add_argument("--native-mor-label", help="load the native MoR architecture for this external checkpoint label")
     parser.add_argument("--exp-labels", nargs="+", help="unique output keys in --exp_names order")
     parser.add_argument("--data-manifest", type=Path, help="score a finite prefix and record its packed-token digest")
     parser.add_argument("--attn_implementation", choices=("eager", "sdpa", "flash_attention_2"))
@@ -282,6 +281,8 @@ def main():
     labels = args.exp_labels or args.exp_names
     if len(labels) != len(args.exp_names) or len(set(labels)) != len(labels):
         parser.error("Supply one unique result label per experiment")
+    if args.native_mor_label and (not args.checkpoint_dirs or args.native_mor_label not in labels):
+        parser.error("--native-mor-label requires a matching result label and explicit checkpoint directories")
     if args.checkpoint_dirs and len(args.checkpoint_dirs) != len(args.exp_names):
         parser.error("--checkpoint-dirs needs one entry per experiment")
     if args.sample_number < 0:
@@ -306,7 +307,7 @@ def main():
     for exp_name, label, weights_dir in zip(experiment_names, labels, args.checkpoint_dirs or [None] * len(labels), strict=True):
         data = {} if args.data_manifest else None
         loss = evaluate_model(exp_name, global_sample_number, state, args.attn_implementation,
-                              args.strict, args.latest_saved, weights_dir, data)
+                              args.strict, args.latest_saved, weights_dir, data, native_mor=label == args.native_mor_label)
         if data is not None:
             manifests[label] = data
         all_results[label] = loss # loss can be float or None

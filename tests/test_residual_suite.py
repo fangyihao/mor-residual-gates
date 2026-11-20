@@ -222,10 +222,17 @@ def test_reject_latest_as_missing_ablation(tmp_path, monkeypatch):
         suite.completed(run)
 
 
-def test_npu_paper_preset_reaches_all_three_train_launches(launch):
-    result, calls = launch("npu", ["--train-only", "--paper-comparison", "seed=31"])
+@pytest.mark.parametrize("options,methods,short", [
+    ([], ("rezero", "rezero_stage"), set()),
+    (["--ablation-steps", "3540"], ("rezero", "rezero_stage", "uniform", "power"), {"uniform", "power"}),
+    (["--ablation-steps", "3540", "--ablations-only"], ("rezero", "rezero_stage", "uniform", "power"),
+     {"rezero", "rezero_stage", "uniform", "power"}),
+])
+def test_npu_paper_matrix(launch, options, methods, short):
+    result, calls = launch("npu", ["--train-only", "--paper-comparison", "seed=31", *options])
     assert result.returncode == 0, result.stderr
-    assert len(calls) == 3
-    for (_, args, _), method in zip(calls, ("original_mor", "rezero", "rezero_stage"), strict=True):
+    for (_, args, _), method in zip(calls, methods, strict=True):
         assert args[args.index("--config-name") + 1] == "paper_mor"
         assert f"paper_method={method}" in args
+        assert ("stop_steps=3540" in args) == (method in short)
+        assert ("++ablation_checkpoint_step=3540" in args) == bool(options)

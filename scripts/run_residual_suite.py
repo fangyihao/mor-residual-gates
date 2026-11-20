@@ -17,7 +17,7 @@ sys.path.insert(0, str(ROOT))
 from util.resume import checkpoint_step, evaluation_weights, has_weights, same_recipe, weights_at_step
 
 MODES = ("rezero", "rezero_stage", "full", "uniform", "power")
-PAPER_METHODS = ("original_mor", "rezero", "rezero_stage")
+PAPER_METHODS = ("rezero", "rezero_stage")
 DEFAULT_SEEDS = (1234, 1235, 1236)
 
 
@@ -46,11 +46,13 @@ def training_target(cfg):
     return cfg.num_train_steps if cfg.stop_steps is None else min(cfg.num_train_steps, cfg.stop_steps)
 
 
-def plan(config_name, overrides, seeds, ablation_steps=None, full_budget_control=None):
+def plan(config_name, overrides, seeds, ablation_steps=None, full_budget_control=None, ablations_only=False):
     keys = {arg.partition("=")[0].lstrip("+~") for arg in overrides}
     paper = config_name == "paper_mor"
+    if ablations_only and (not paper or ablation_steps is None):
+        raise ValueError("--ablations-only requires --paper-comparison and --ablation-steps")
     if paper and full_budget_control is not None:
-        raise ValueError("The paper comparison keeps original_mor and both ReZero variants at full budget.")
+        raise ValueError("The paper comparison selects both ReZero variants for the full budget.")
     if paper and ("paper_method" in keys or "recursive.residual" in keys):
         raise ValueError("The paper comparison sets the method and recursive residual per run.")
     if full_budget_control is not None and ablation_steps is None:
@@ -78,7 +80,7 @@ def plan(config_name, overrides, seeds, ablation_steps=None, full_budget_control
                 args = list(common)
                 if paper:
                     args.append(f"paper_method={mode}")
-                args.append("recursive.residual=null" if mode == "original_mor" else f"recursive.residual.mode={mode}")
+                args.append(f"recursive.residual.mode={mode}")
                 if "seed" not in keys:
                     args.append(f"seed={seed}")
                 if ablation_steps is not None:
@@ -87,7 +89,7 @@ def plan(config_name, overrides, seeds, ablation_steps=None, full_budget_control
                         raise ValueError(f"--ablation-steps must be positive and below the full training "
                                          f"target ({training_target(original)} optimizer steps)")
                     args.append(f"++ablation_checkpoint_step={ablation_steps}")
-                    if mode not in long_modes:
+                    if ablations_only or mode not in long_modes:
                         args = [a for a in args if a.partition("=")[0].lstrip("+~") != "stop_steps"]
                         args.append(f"stop_steps={ablation_steps}")
                 cfg = compose(config_name, overrides=args)
@@ -142,12 +144,14 @@ def main():
     parser.add_argument("devices")
     parser.add_argument("--seeds", type=seed_list, help="comma-separated seeds (default 1234,1235,1236)")
     parser.add_argument("--paper-comparison", action="store_true",
-                        help="compare native MoR and both ReZero variants using the released Table 3 training recipe")
+                        help="train both ReZero variants using the released MoR Table 3 recipe")
     parser.add_argument("--author-checkpoint", type=Path, help="also score the authors’ released Table 3 K=3 MoR weight directory")
     parser.add_argument("--benchmark-shots", help="override released harness shot counts, e.g. mmlu_continuation=5")
     parser.add_argument("--nll-only", action="store_true", help="skip the downstream benchmarks in the paper comparison")
     parser.add_argument("--ablation-steps", type=int, metavar="S",
                         help="stop auxiliary runs at S optimizer updates and score all modes at S")
+    parser.add_argument("--ablations-only", action="store_true",
+                        help="stop all four paper methods at --ablation-steps and score only that checkpoint")
     parser.add_argument("--full-budget-control", choices=(*MODES[1:], "none"),
                         help="control to continue alongside rezero (default rezero_stage in a shorter suite)")
     parser.add_argument("--auto-resume", action=argparse.BooleanOptionalAction, default=None,
@@ -161,6 +165,8 @@ def main():
     args = parser.parse_intermixed_args()
     if (args.nll_only or args.author_checkpoint or args.benchmark_shots) and not args.paper_comparison:
         parser.error("Paper evaluation options require --paper-comparison")
+    if args.ablations_only and (args.benchmark_shots or args.author_checkpoint):
+        parser.error("--benchmark-shots and --author-checkpoint apply to the full-budget evaluation")
     if args.benchmark_shots:
         from scripts.paper_benchmarks import shot_overrides
         try:
@@ -187,11 +193,11 @@ def main():
             if any(arg.partition("=")[0] == "auto_resume" for arg in overrides):
                 raise ValueError("Specify --auto-resume or the Hydra auto_resume override only once")
             overrides.append("auto_resume=" + str(args.auto_resume).lower())
-        runs = plan(config, overrides, args.seeds, args.ablation_steps, args.full_budget_control)
+        runs = plan(config, overrides, args.seeds, args.ablation_steps, args.full_budget_control, args.ablations_only)
         if args.author_checkpoint:
             from scripts.paper_comparison import RELEASED_CONFIG, recipe_changes
             reference = OmegaConf.to_container(OmegaConf.load(ROOT / "conf/pretrain" / (RELEASED_CONFIG + ".yaml")))
-            changes = recipe_changes(next(r.config for r in runs if r.mode == "original_mor"), reference)
+            changes = recipe_changes(runs[0].config, reference)
             structural = {"model", "model_config", "recursive", "mor", "kv_sharing", "relaxation", "tokenizer"} & changes.keys()
             if structural:
                 raise ValueError(f"Author checkpoint scoring requires the released architecture and router: {sorted(structural)}")
@@ -238,15 +244,19 @@ def main():
         evaluate(runs, args, output)
         return
 
-    long_runs = [run for run in runs if training_target(run.config) > (args.ablation_steps or 0)]
-    full_target = training_target(long_runs[0].config)
-    base = ROOT / (args.output_file or ("paper_mor_fineweb.json" if args.paper_comparison else "residual_suite_fineweb.json"))
-    full_output = base.with_name(f"{base.stem}.full-step-{full_target}{base.suffix}")
-    evaluated = False
-    panels = [(full_target, long_runs, output)]
+    panels = []
     if args.ablation_steps:
-        panels = [(args.ablation_steps, runs, output), (full_target, long_runs, full_output)]
-    for step, group, destination in panels:
+        panels.append((args.ablation_steps, runs, output, False))
+    long_runs = [run for run in runs if training_target(run.config) > (args.ablation_steps or 0)]
+    if long_runs:
+        full_target = training_target(long_runs[0].config)
+        destination = output
+        if args.ablation_steps:
+            base = ROOT / (args.output_file or ("paper_mor_fineweb.json" if args.paper_comparison else "residual_suite_fineweb.json"))
+            destination = base.with_name(f"{base.stem}.full-step-{full_target}{base.suffix}")
+        panels.append((full_target, long_runs, destination, args.paper_comparison))
+    evaluated = False
+    for step, group, destination, paper_final in panels:
         selected = []
         for run in group:
             directory = ROOT / "results/pretrain" / run.directory
@@ -264,7 +274,7 @@ def main():
             selected.append(replace(run, weights=weights))
         if selected:
             print(f"Evaluating {len(selected)} runs at optimizer step {step} -> {destination}", flush=True)
-            evaluate(selected, args, destination, paper_final=args.paper_comparison and step == full_target)
+            evaluate(selected, args, destination, paper_final=paper_final)
             evaluated = True
     if not evaluated:
         parser.error("No saved weights match the requested ablation or full training step.")
@@ -284,18 +294,19 @@ def evaluate(runs, args, output, paper_final=False):
     sources = [r.directory for r in runs]
     labels = list(sources)
     weights = [str(r.weights) for r in runs if r.weights is not None]
+    native_option = []
     if paper_final and args.author_checkpoint:
-        native = next((r for r in runs if r.mode == "original_mor"), None)
-        if native is None:
-            raise ValueError("Rescoring the author checkpoint needs a saved native MoR run configuration.")
-        sources.append(native.directory)
+        # Use the same data, precision and backbone as the local runs. Both scorers
+        # explicitly reconstruct the native router for these external weights.
+        sources.append(runs[0].directory)
         labels.append("authors_checkpoint_rescored")
         weights.append(str(args.author_checkpoint))
+        native_option = ["--native-mor-label", labels[-1]]
     scoring = ["--checkpoint-dirs", *weights] if weights else ["--latest-saved"]
     if args.paper_comparison:
         scoring.extend(["--exp-labels", *labels, "--data-manifest", str(output.with_suffix(".data.json"))])
     subprocess.run([*evaluate, "--exp_names", *sources, "--sample_number", str(args.sample_number),
-                    "--output_file", str(output), *scoring, "--strict"], cwd=ROOT, env=env, check=True)
+                    "--output_file", str(output), *scoring, *native_option, "--strict"], cwd=ROOT, env=env, check=True)
     if args.backend == "npu" and int(env.get("NNODES", "1")) > 1 and int(env["NODE_RANK"]) != 0:
         return
     if paper_final:
@@ -309,7 +320,7 @@ def evaluate(runs, args, output, paper_final=False):
                 env["CUDA_VISIBLE_DEVICES"] = first_device
             benchmark_file = output.with_suffix(".benchmarks.json")
             subprocess.run([sys.executable, "scripts/paper_benchmarks.py", "--runs", *sources, "--labels", *labels,
-                            "--weights", *weights, "--output", str(benchmark_file),
+                            "--weights", *weights, "--output", str(benchmark_file), *native_option,
                             *(["--shots", args.benchmark_shots] if args.benchmark_shots else [])],
                            cwd=ROOT, env=env, check=True)
             downstream = json.loads(benchmark_file.read_text())
