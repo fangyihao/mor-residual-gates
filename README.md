@@ -88,31 +88,55 @@ bash scripts/run_npu.sh all 0,1,2,3,4,5,6,7 --paper-comparison
 # Equivalent suite on two GPUs
 bash scripts/pretrain.sh accelerate offline 0,1 all -- --paper-comparison
 
-# Two full-budget runs and four matched early evaluations per seed
-bash scripts/run_npu.sh all 0,1,2,3,4,5,6,7 --paper-comparison --ablation-steps 3540
+# Both full-budget runs and the 15 matched early evaluations per seed
+bash scripts/run_npu.sh all 0,1,2,3,4,5,6,7 --paper-comparison --ablation-steps 512
 
-# Run only the four short ablations; the combined command above can resume both ReZero runs later
-bash scripts/run_npu.sh all 0,1,2,3,4,5,6,7 --paper-comparison --ablation-steps 3540 --ablations-only
+# Run only the short panel (512 updates by default)
+bash scripts/run_npu.sh all 0,1,2,3,4,5,6,7 --paper-comparison --ablations-only
 
 # Score full-budget checkpoints, including a local copy of the authors’ matching native MoR weights
 bash scripts/run_npu.sh all 0,1,2,3,4,5,6,7 --paper-comparison --eval-only \
   --author-checkpoint /path/to/original-mor-360m-k3-expert-cache
 ```
 
-All paper experiments shown here use **$K=3$**, including the short ablations. A token can execute the recursive body up to three times. The first execution is ungated and stages 2 and 3 apply the selected residual rule. At the default $\Lambda_R=1$ and $\zeta=1$, uniform scaling uses $(0.5,0.5)$ and power-law scaling uses $(0.6,0.4)$.
+The **main comparison uses $K=3$**. The **short ablations use $K=2,3,4$**. Here $K$ counts the first execution and all possible extra executions. Each depth inherits its released Table 3 fixed-FLOPs recipe, including the 34 virtual layers at $K=4$. Within each depth, every short run uses the same initialization recipe, seed, input-token budget, router capacities and learning-rate schedule. Across depths the physical model size and executed work also change.
 
-| Method | Short FineWeb evaluation | Full FineWeb and downstream evaluation |
+| Method | Short FineWeb evaluation at each of $K=2,3,4$ | Full FineWeb and downstream at $K=3$ |
 |---|---:|---:|
-| Layer-specific ReZero | Step 3,540 of the main run | Step 14,161 |
-| Stage-shared ReZero | Step 3,540 of the main run | Step 14,161 |
-| Uniform scaling | Step 3,540 | — |
-| Power-law scaling | Step 3,540 | — |
+| Layer-specific ReZero | Step 512 | Step 14,161 |
+| Stage-shared ReZero | Step 512 | Step 14,161 |
+| Uniform scaling | Step 512 | — |
+| Power-law scaling | Step 512 | — |
+| Native MoR (released router-weighted writeback) | Step 512 | Published reference |
 
-The combined command trains four trajectories per seed. Each ReZero trajectory supplies both checkpoints. The two fixed schedules stop at the short checkpoint, using the same learning-rate schedule as ReZero through that step. Use the combined command from the start to retain the exact early checkpoint, or start with `--ablations-only` and rerun without that flag to continue the gated models. Both commands use the same run names.
+At the default $\Lambda_R=1$ and $\zeta=1$, the two fixed schedules coincide at $K=2$ because there is only one extra execution. The two runs check reproducibility. The $K=3$ and $K=4$ pairs test the effect of distributing the update strength across stages.
+
+The combined command uses 15 trajectories per seed. The first 512 updates of the two main $K=3$ runs also supply their short-panel checkpoints. The other 13 trajectories stop at 512. At the released batch size this is 1,073,741,824 training tokens per short measurement, including 86 warmup updates. Report these results as early-training NLL. The shorter panel supports within-depth comparisons of optimization and representation drift. Use the full runs for end-of-training claims. Native MoR retains the authors’ router-weighted additive writeback. Its comparison with ReZero includes the change in writeback as well as residual scaling.
+
+To reduce the budget further, specify e.g. `--ablations-only --ablation-steps 256` (536,870,912 tokens per trajectory), or select depths with `--ablation-ks 2,4`. Use the combined command from the start to retain the exact early checkpoint, or run the short panel first and repeat the command without `--ablations-only`, explicitly supplying the same `--ablation-steps`, to continue both main models. An existing long run can supply the short measurement if it retained weights at the requested step.
 
 Repeat the original command to resume training. Use `--train-only` to defer evaluation, `--eval-only` to score saved checkpoints at the requested step, or `--nll-only` to defer downstream scoring. Repeat the same training overrides in evaluation-only mode. For a separate pilot, use a distinct `name=...` prefix. The optional authors’ checkpoint directory accepts Hugging Face safetensors or PyTorch weights, including shards. Select the fixed-FLOPs K=3 checkpoint from the authors’ release and retain its provenance. The runner records the supplied weight hashes. [Authors’ checkpoint release](https://drive.google.com/drive/folders/1pYKJOu2aBGC-jgoWbfP6T_vqEYtUVxa4?usp=drive_link)
 
-The default output `paper_mor_fineweb.paper.md` contains the reported MoR row and the local means, sample standard deviations, seed counts and measured training tokens. The adjacent `.paper.json` includes per-seed results, paired differences, trainable gate counts, executed token-layers and differences from the released training recipe. The optional shorter panel scores all four methods at the same early step on FineWeb, and writes the downstream results and paper table at the full step. Use the full-budget paired results for end-of-training claims. The native baseline in the report is the published measurement. Optionally rescore the authors’ weights with `--author-checkpoint` to check for evaluation differences without training a baseline. Comparisons against published MoR describe the overall method difference. Comparing the two ReZero variants isolates gate sharing. To measure the contribution of adding a gate under identical writeback, include a fixed full-strength control in a separate ablation.
+The default output `paper_mor_fineweb.paper.md` contains the reported MoR row and the local means, sample standard deviations, seed counts and measured training tokens. The adjacent `.paper.json` includes per-seed results, paired differences, trainable gate counts, executed token-layers and differences from the released training recipe. The short panel also writes `paper_mor_fineweb.step-512.ablations.csv` with one row per depth, seed and method. Its signed `nll_minus_native` pairs each method with a native run at the same depth, seed, step and measured training-token count. Negative values favor the method. A missing match leaves the field blank. The adjacent `.data.json` records the held-out token fingerprint. Use the full-budget paired results for end-of-training claims. The native baseline in the report is the published measurement. Optionally rescore the authors’ weights with `--author-checkpoint` to check for evaluation differences without training a baseline. Comparisons against published MoR describe the overall method difference. Comparing the two ReZero variants isolates gate sharing. To measure the contribution of adding a gate under identical writeback, include a fixed full-strength control in a separate ablation.
+
+#### Plot training and recursion dynamics
+
+Paper runs write one rank-zero `results/pretrain/<run>/training_metrics.jsonl` file each. Training records include optimizer step, seed, method, $K$, total loss, LM loss, weighted auxiliary loss, global gradient norm, optimizer-group learning rates and weight decay, and the mixed-precision loss scale when used. Token counts, executed token-layers, throughput, global worker count, per-device batch size and accumulation are recorded for each interval. Use `cumulative_input_tokens` to align runs by data exposure.
+
+Expert-router records include per-stage selected-token counts, reach fractions, sampling losses and accuracies where defined. For Middle-Cycle, `depth/<j>/fraction` is the fraction of tokens that stopped at exactly $j$ executions. Each independent learnable scalar has a signed `gate/<parameter>` and a `gate_grad/<parameter>` when the optimizer exposes its clipped gradient. Fixed schedules record `epsilon/stage_<j>`. Per-block `hidden/<module>/input_rms`, `output_rms`, `raw_update_rms` and `update_rms` measure the block input, output, raw repeated-block change and applied change. These RMS measurements sample up to 16 evenly spaced active positions on the first microbatch of each interval per worker. For native MoR the block-output sample precedes router weighting. Use `router/<module>/writeback_rms` for the actual stage-level change at sampled selected token positions in every method.
+
+The paper presets log every ten optimizer steps. The separate pretrained `recursive_residual` preset also accepts `plot_states=true`. Pass `logging_steps=1` for every update, `plot_hidden_samples=0` to skip activation sampling, or `plot_states=false` to disable the additional plotting records. Checkpoint and stop steps also flush interval counters. Resuming rebuilds the JSONL through the restored checkpoint and appends subsequent observations. The full model, optimizer, scheduler, available scaler, per-rank RNG and dataset continuation state are saved by the checkpoint machinery. Earlier checkpoints keep their original metric history.
+
+```python
+import pandas as pd
+
+df = pd.read_json(
+    "results/pretrain/paper_mor_k3_rezero_seed1234/training_metrics.jsonl", lines=True
+)
+training = df.loc[df["event"].eq("train")].set_index("cumulative_input_tokens")
+training[["lm_loss", "weighted_aux_loss"]].plot(subplots=True)
+training.filter(regex=r"^gate/").plot(legend=False)
+```
 
 For the main manuscript, insert `\input{paper_mor_fineweb.table3-rows.tex}` immediately before the final rule in Table 3. With shorter ablations the fragment is named after the full-step output. It appends **Layer-specific ReZero** and **Stage-shared ReZero** in the original 16-column order. The cells contain seed means, measured non-embedding parameter counts rounded to millions, and the actual training tokens in billions. Include the seed count in the caption and retain per-seed results in the supplement. A pilot, an NLL-only evaluation, missing work records or unpaired gated runs produce a comment explaining what is missing in place of publishable rows.
 

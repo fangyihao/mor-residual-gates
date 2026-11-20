@@ -1,6 +1,7 @@
 """Train every recursive-residual mode with paired seeds, then score the checkpoints."""
 import argparse
 from collections import Counter, defaultdict
+import csv
 from dataclasses import dataclass, replace
 import json
 import os
@@ -30,6 +31,7 @@ class Run:
     overrides: list[str]
     config: DictConfig
     weights: Path | None = None
+    preset: str = "recursive_residual"
 
 
 def seed_list(value):
@@ -46,9 +48,42 @@ def training_target(cfg):
     return cfg.num_train_steps if cfg.stop_steps is None else min(cfg.num_train_steps, cfg.stop_steps)
 
 
-def plan(config_name, overrides, seeds, ablation_steps=None, full_budget_control=None, ablations_only=False):
-    keys = {arg.partition("=")[0].lstrip("+~") for arg in overrides}
+def plan(config_name, overrides, seeds, ablation_steps=None, full_budget_control=None, ablations_only=False,
+         ablation_ks=None):
     paper = config_name == "paper_mor"
+    if ablation_ks is not None and (not paper or ablation_steps is None):
+        raise ValueError("--ablation-ks requires a paper ablation suite")
+    if not paper:
+        return plan_depth(config_name, overrides, seeds, ablation_steps, full_budget_control, ablations_only)
+
+    with initialize_config_dir(config_dir=str(ROOT / "conf/pretrain"), version_base=None):
+        main_k = compose(config_name, overrides=overrides).recursive.num_recursion
+    main_preset = f"paper_mor_k{main_k}" if main_k in (2, 4) else config_name
+    if ablation_steps is None:
+        return plan_depth(main_preset, overrides, seeds, None, full_budget_control, ablations_only)
+    sets_depth = any(a.partition("=")[0].lstrip("+~") == "recursive.num_recursion" for a in overrides)
+    depths = list(ablation_ks) if ablation_ks is not None else ([main_k] if sets_depth else [2, 3, 4])
+    if not depths or len(depths) != len(set(depths)) or any(k not in (2, 3, 4) and k != main_k for k in depths):
+        raise ValueError("--ablation-ks takes distinct released depths 2,3,4 or the configured main depth")
+    runs = []
+    if not ablations_only or main_k in depths:
+        runs += plan_depth(main_preset, overrides, seeds, ablation_steps if main_k in depths else None,
+                           full_budget_control, ablations_only)
+    for k in depths:
+        if k == main_k:
+            continue
+        common = [a for a in overrides if a.partition("=")[0].lstrip("+~") != "recursive.num_recursion"]
+        preset = "paper_mor" if k == 3 else f"paper_mor_k{k}"
+        runs += plan_depth(preset, common, seeds, ablation_steps, full_budget_control, True, extra_k=k)
+    directories = {(ROOT / "results/pretrain" / r.directory).resolve() for r in runs}
+    if len(directories) != len(runs):
+        raise ValueError("Depth sweep produced overlapping checkpoint directories")
+    return runs
+
+
+def plan_depth(config_name, overrides, seeds, ablation_steps, full_budget_control, ablations_only, extra_k=None):
+    keys = {arg.partition("=")[0].lstrip("+~") for arg in overrides}
+    paper = config_name in {"paper_mor", "paper_mor_k2", "paper_mor_k4"}
     if ablations_only and (not paper or ablation_steps is None):
         raise ValueError("--ablations-only requires --paper-comparison and --ablation-steps")
     if paper and full_budget_control is not None:
@@ -60,7 +95,7 @@ def plan(config_name, overrides, seeds, ablation_steps=None, full_budget_control
     long_modes = set(PAPER_METHODS) if paper else {"rezero", full_budget_control or "rezero_stage"}
     modes = PAPER_METHODS if paper else MODES
     if paper and ablation_steps:
-        modes += ("uniform", "power")
+        modes += ("uniform", "power", "original_mor")
     if ablation_steps is not None and "ablation_checkpoint_step" in keys:
         raise ValueError("--ablation-steps sets ablation_checkpoint_step automatically")
     if "recursive.residual.mode" in keys:
@@ -80,7 +115,7 @@ def plan(config_name, overrides, seeds, ablation_steps=None, full_budget_control
                 args = list(common)
                 if paper:
                     args.append(f"paper_method={mode}")
-                args.append(f"recursive.residual.mode={mode}")
+                args.append("recursive.residual=null" if mode == "original_mor" else f"recursive.residual.mode={mode}")
                 if "seed" not in keys:
                     args.append(f"seed={seed}")
                 if ablation_steps is not None:
@@ -93,20 +128,23 @@ def plan(config_name, overrides, seeds, ablation_steps=None, full_budget_control
                         args = [a for a in args if a.partition("=")[0].lstrip("+~") != "stop_steps"]
                         args.append(f"stop_steps={ablation_steps}")
                 cfg = compose(config_name, overrides=args)
-                runs.append(Run(seed, mode, cfg.name, cfg.output_dir or cfg.name, args, cfg))
+                runs.append(Run(seed, mode, cfg.name, cfg.output_dir or cfg.name, args, cfg, preset=config_name))
 
     # A literal name or output_dir supplied to the whole suite is a prefix.
     # Names that already distinguish every run retain the preset's resume paths.
     names = Counter(run.name for run in runs)
     paths = Counter(run.directory for run in runs)
     for run in runs:
-        suffix = f"_{run.mode}_seed{run.seed}"
-        if names[run.name] > 1:
-            run.name += suffix
+        suffix = (f"_k{extra_k}" if extra_k is not None else "") + f"_{run.mode}_seed{run.seed}"
+        # A custom template may distinguish seeds and methods but omit depth.
+        custom_name = extra_k is not None and "name" in keys
+        custom_dir = extra_k is not None and ("output_dir" in keys or (custom_name and not run.config.output_dir))
+        if names[run.name] > 1 or custom_name:
+            run.name += suffix if names[run.name] > 1 else f"_k{extra_k}"
             run.config.name = run.name
             run.overrides.append(f"name={json.dumps(run.name)}")
-        if paths[run.directory] > 1:
-            run.directory += suffix
+        if paths[run.directory] > 1 or custom_dir:
+            run.directory += suffix if paths[run.directory] > 1 else f"_k{extra_k}"
             run.config.output_dir = run.directory
             run.overrides.append(f"output_dir={json.dumps(run.directory)}")
     resolved = {(ROOT / "results/pretrain" / run.directory).resolve() for run in runs}
@@ -150,8 +188,10 @@ def main():
     parser.add_argument("--nll-only", action="store_true", help="skip the downstream benchmarks in the paper comparison")
     parser.add_argument("--ablation-steps", type=int, metavar="S",
                         help="stop auxiliary runs at S optimizer updates and score all modes at S")
+    parser.add_argument("--ablation-ks", type=seed_list, metavar="K,...",
+                        help="depths for the short paper panel (default 2,3,4)")
     parser.add_argument("--ablations-only", action="store_true",
-                        help="stop all four paper methods at --ablation-steps and score only that checkpoint")
+                        help="run only the short paper panel (default 512 steps)")
     parser.add_argument("--full-budget-control", choices=(*MODES[1:], "none"),
                         help="control to continue alongside rezero (default rezero_stage in a shorter suite)")
     parser.add_argument("--auto-resume", action=argparse.BooleanOptionalAction, default=None,
@@ -163,6 +203,8 @@ def main():
     parser.add_argument("--output-file", type=Path, help="loss JSON (the matched-step results when using --ablation-steps)")
     parser.add_argument("overrides", nargs="*", help="shared Hydra training overrides")
     args = parser.parse_intermixed_args()
+    if args.ablations_only and args.ablation_steps is None:
+        args.ablation_steps = 512
     if (args.nll_only or args.author_checkpoint or args.benchmark_shots) and not args.paper_comparison:
         parser.error("Paper evaluation options require --paper-comparison")
     if args.ablations_only and (args.benchmark_shots or args.author_checkpoint):
@@ -193,7 +235,7 @@ def main():
             if any(arg.partition("=")[0] == "auto_resume" for arg in overrides):
                 raise ValueError("Specify --auto-resume or the Hydra auto_resume override only once")
             overrides.append("auto_resume=" + str(args.auto_resume).lower())
-        runs = plan(config, overrides, args.seeds, args.ablation_steps, args.full_budget_control, args.ablations_only)
+        runs = plan(config, overrides, args.seeds, args.ablation_steps, args.full_budget_control, args.ablations_only, args.ablation_ks)
         if args.author_checkpoint:
             from scripts.paper_comparison import RELEASED_CONFIG, recipe_changes
             reference = OmegaConf.to_container(OmegaConf.load(ROOT / "conf/pretrain" / (RELEASED_CONFIG + ".yaml")))
@@ -226,17 +268,15 @@ def main():
         if output.is_dir():
             parser.error(f"--output-file points to a directory: {output}")
         output.parent.mkdir(parents=True, exist_ok=True)
-    if npu:
-        train = ["bash", "scripts/run_npu.sh", "train", args.devices]
-    else:
-        train = ["bash", "scripts/pretrain.sh", args.backend, os.environ.get("WANDB_MODE", "online"),
-                 args.devices, config, "--"]
     for index, run in enumerate([] if args.eval_only else runs, 1):
         if run.directory in finished:
             print(f"[{index}/{len(runs)}] {run.directory} already complete", flush=True)
             continue
         print(f"[{index}/{len(runs)}] {run.directory} (mode={run.mode}, seed={run.seed})", flush=True)
-        subprocess.run([*train, *run.overrides], cwd=ROOT, env={**os.environ, "CONFIG_NAME": config}, check=True)
+        train = (["bash", "scripts/run_npu.sh", "train", args.devices] if npu else
+                 ["bash", "scripts/pretrain.sh", args.backend, os.environ.get("WANDB_MODE", "online"),
+                  args.devices, run.preset, "--"])
+        subprocess.run([*train, *run.overrides], cwd=ROOT, env={**os.environ, "CONFIG_NAME": run.preset}, check=True)
     if args.train_only:
         return
 
@@ -246,7 +286,7 @@ def main():
 
     panels = []
     if args.ablation_steps:
-        panels.append((args.ablation_steps, runs, output, False))
+        panels.append((args.ablation_steps, [r for r in runs if r.config.get("ablation_checkpoint_step") == args.ablation_steps], output, False))
     long_runs = [run for run in runs if training_target(run.config) > (args.ablation_steps or 0)]
     if long_runs:
         full_target = training_target(long_runs[0].config)
@@ -326,6 +366,7 @@ def evaluate(runs, args, output, paper_final=False):
             downstream = json.loads(benchmark_file.read_text())
         write_report(ROOT, runs, output, downstream, args.author_checkpoint)
     losses = json.loads(output.read_text())
+    observations = []
     layer_specific = {}
     paired_deltas = defaultdict(list)
     for run in runs:
@@ -335,18 +376,21 @@ def evaluate(runs, args, output, paper_final=False):
         step = state.get("global_step")
         rows = [row for row in state.get("log_history", []) if "loss" in row]
         work = ""
-        tokens = None
+        tokens = token_layers = None
         if rows and all("executed_token_layers" in row and "input_tokens" in row for row in rows):
             tokens = sum(row["input_tokens"] for row in rows)
             token_layers = sum(row["executed_token_layers"] for row in rows)
             work = f"  tokens={tokens}  executed_token_layers={token_layers}"
         print(f"{run.directory}  step={step}  NLL={losses[run.directory]:.7f}{work}")
+        observations.append(dict(k=run.config.recursive.num_recursion, seed=run.seed, method=run.mode,
+                                 step=step, input_tokens=tokens, executed_token_layers=token_layers,
+                                 fineweb_nll=losses[run.directory], run=run.directory))
         if run.mode == "rezero":
-            layer_specific[run.seed] = (step, tokens, losses[run.directory])
+            layer_specific[(run.config.recursive.num_recursion, run.seed)] = (step, tokens, losses[run.directory])
             continue
-        if run.seed not in layer_specific or (args.ablation_steps is None and run.mode != "rezero_stage"):
+        if (run.config.recursive.num_recursion, run.seed) not in layer_specific or (args.ablation_steps is None and run.mode != "rezero_stage"):
             continue
-        reference_step, reference_tokens, reference_loss = layer_specific[run.seed]
+        reference_step, reference_tokens, reference_loss = layer_specific[(run.config.recursive.num_recursion, run.seed)]
         if reference_step != step:
             continue
         if args.ablation_steps and reference_tokens is not None and tokens is not None and reference_tokens != tokens:
@@ -355,12 +399,29 @@ def evaluate(runs, args, output, paper_final=False):
         delta = reference_loss - losses[run.directory]
         label = "stage-shared" if run.mode == "rezero_stage" else run.mode
         print(f"seed={run.seed}  layer-specific minus {label} NLL={delta:+.7f}")
-        paired_deltas[label].append(delta)
+        paired_deltas[(run.config.recursive.num_recursion, label)].append(delta)
+    if args.paper_comparison and args.ablation_steps and not paper_final:
+        write_ablation_csv(output.with_suffix(".ablations.csv"), observations)
     if args.ablation_steps:
-        for label, values in paired_deltas.items():
+        for (k, label), values in paired_deltas.items():
             if len(values) > 1:
-                print(f"layer-specific minus {label}: mean paired NLL difference={mean(values):+.7f}  "
+                print(f"K={k} layer-specific minus {label}: mean paired NLL difference={mean(values):+.7f}  "
                       f"sample SD={stdev(values):.7f}  paired seeds={len(values)}")
+
+
+def write_ablation_csv(path, observations):
+    def pair_key(row):
+        return row["k"], row["seed"], row["step"], row["input_tokens"]
+
+    native = {pair_key(row): row["fineweb_nll"] for row in observations if row["method"] == "original_mor"
+              and row["input_tokens"] is not None and row["step"] is not None}
+    with path.open("w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=["k", "seed", "method", "step", "input_tokens",
+                                                    "executed_token_layers", "fineweb_nll", "nll_minus_native", "run"])
+        writer.writeheader()
+        for row in observations:
+            baseline = native.get(pair_key(row))
+            writer.writerow(dict(row, nll_minus_native=row["fineweb_nll"] - baseline if baseline is not None else None))
 
 
 if __name__ == "__main__":

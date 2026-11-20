@@ -1,0 +1,17 @@
+name: paper_mor_k${recursive.num_recursion}_${paper_method}_seed${seed}
+paper_method: rezero
+seed: 1234
+auto_resume: true
+wandb: false
+wandb_run_id: null
+wandb_entity: null
+track_token_layers: true
+plot_states: true
+plot_hidden_samples: 16
+logging_steps: 10
+ablation_checkpoint_step: null
+recursive:
+  residual:
+    mode: rezero
+    lambda_r: 1.0
+    zeta: 1.0

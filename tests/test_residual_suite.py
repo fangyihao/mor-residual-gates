@@ -222,17 +222,23 @@ def test_reject_latest_as_missing_ablation(tmp_path, monkeypatch):
         suite.completed(run)
 
 
-@pytest.mark.parametrize("options,methods,short", [
-    ([], ("rezero", "rezero_stage"), set()),
-    (["--ablation-steps", "3540"], ("rezero", "rezero_stage", "uniform", "power"), {"uniform", "power"}),
-    (["--ablation-steps", "3540", "--ablations-only"], ("rezero", "rezero_stage", "uniform", "power"),
-     {"rezero", "rezero_stage", "uniform", "power"}),
+@pytest.mark.parametrize("options,short_step,only", [
+    ([], None, False),
+    (["--ablation-steps", "128"], 128, False),
+    (["--ablations-only"], 512, True),
 ])
-def test_npu_paper_matrix(launch, options, methods, short):
+def test_npu_paper_matrix(launch, options, short_step, only):
     result, calls = launch("npu", ["--train-only", "--paper-comparison", "seed=31", *options])
     assert result.returncode == 0, result.stderr
-    for (_, args, _), method in zip(calls, methods, strict=True):
-        assert args[args.index("--config-name") + 1] == "paper_mor"
+    methods = ["rezero", "rezero_stage"]
+    if short_step:
+        methods += ["uniform", "power", "original_mor"]
+    depths = [3, 2, 4] if short_step else [3]
+    pairs = [(k, method) for k in depths for method in methods]
+    for (_, args, _), (k, method) in zip(calls, pairs, strict=True):
+        assert args[args.index("--config-name") + 1] == ("paper_mor" if k == 3 else f"paper_mor_k{k}")
         assert f"paper_method={method}" in args
-        assert ("stop_steps=3540" in args) == (method in short)
-        assert ("++ablation_checkpoint_step=3540" in args) == bool(options)
+        assert ("recursive.residual=null" in args) == (method == "original_mor")
+        short = short_step is not None and (only or k != 3 or method not in methods[:2])
+        assert (f"stop_steps={short_step}" in args) == short
+        assert (f"++ablation_checkpoint_step={short_step}" in args) == bool(short_step)

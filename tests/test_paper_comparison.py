@@ -1,4 +1,5 @@
 """The historical reference, optional author checkpoint and locally paired ReZero measurements."""
+import csv
 import json
 from types import SimpleNamespace
 
@@ -8,28 +9,52 @@ import pytest
 
 from scripts.paper_benchmarks import TASKS, shot_overrides, table_metrics, task_specs
 from scripts.paper_comparison import PUBLISHED, RELEASED_CONFIG, paired_results, recipe_changes, write_report
-from scripts.run_residual_suite import PAPER_METHODS, ROOT, plan, training_target
+from scripts.run_residual_suite import PAPER_METHODS, ROOT, plan, training_target, write_ablation_csv
 
 
 def test_paper_recipes_and_control_budgets():
-    reference = OmegaConf.to_container(OmegaConf.load(ROOT / "conf/pretrain" / (RELEASED_CONFIG + ".yaml")))
-    runs = plan("paper_mor", [], [1234], 3540)
-    assert PAPER_METHODS == ("rezero", "rezero_stage")
-    assert [r.mode for r in runs] == [*PAPER_METHODS, "uniform", "power"]
+    methods = (*PAPER_METHODS, "uniform", "power", "original_mor")
+    runs = plan("paper_mor", [], [1234], 512)
+    assert {(r.config.recursive.num_recursion, r.mode) for r in runs} == {
+        (k, method) for k in (2, 3, 4) for method in methods}
+    assert len(runs) == 15
     for run in runs:
         cfg = run.config
+        k = cfg.recursive.num_recursion
+        released = RELEASED_CONFIG.replace("_rec3_", f"_rec{k}_")
+        reference = OmegaConf.to_container(OmegaConf.load(ROOT / "conf/pretrain" / (released + ".yaml")))
         with initialize_config_dir(config_dir=str(ROOT / "conf/pretrain"), version_base=None):
-            assert compose("paper_mor", overrides=run.overrides) == cfg
+            assert compose(run.preset, overrides=run.overrides) == cfg
         assert cfg.seed == 1234 and cfg.paper_method == run.mode
-        assert cfg.name == f"paper_mor_k3_{run.mode}_seed1234"
+        assert cfg.name == f"paper_mor_k{k}_{run.mode}_seed1234"
         assert not recipe_changes(cfg, reference)
         assert cfg.use_pretrained_weights is False and cfg.recursive.sharing == "middle_cycle"
-        assert cfg.recursive.initialization == "random"
-        assert cfg.recursive.num_recursion == 3 and cfg.recursive.residual.mode == run.mode
-        assert cfg.num_train_steps == 14161 and cfg.ablation_checkpoint_step == 3540
-        assert training_target(cfg) == (14161 if run.mode in PAPER_METHODS else 3540)
+        if run.mode == "original_mor":
+            assert cfg.recursive.residual is None
+        else:
+            assert cfg.recursive.residual.mode == run.mode
+        assert cfg.num_train_steps == {2: 12619, 3: 14161, 4: 14216}[k]
+        if k == 4:
+            assert cfg.model_config.num_hidden_layers == 34
+        assert cfg.ablation_checkpoint_step == 512
+        assert training_target(cfg) == (14161 if k == 3 and run.mode in PAPER_METHODS else 512)
     with pytest.raises(ValueError, match="full budget"):
-        plan("paper_mor", [], [1234], 3540, "none")
+        plan("paper_mor", [], [1234], 512, "none")
+
+
+def test_select_ablation_depths_and_pair_csv(tmp_path):
+    runs = plan("paper_mor", ["name=pilot_${paper_method}_${seed}"], [31], 128, ablation_ks=[2, 4])
+    assert len({r.directory for r in runs}) == 12
+    assert all(r.config.get("ablation_checkpoint_step") is None for r in runs[:2])
+    assert all(training_target(r.config) == 128 for r in runs[2:])
+    base = dict(k=3, seed=31, step=128, input_tokens=131072, executed_token_layers=2000000, run="pilot")
+    rows = [dict(base, method="rezero", fineweb_nll=3.5), dict(base, method="original_mor", fineweb_nll=4),
+            dict(base, method="power", k=4, fineweb_nll=3.0),
+            dict(base, method="uniform", input_tokens=None, fineweb_nll=3.9)]
+    path = tmp_path / "ablations.csv"
+    write_ablation_csv(path, rows)
+    with path.open() as f:
+        assert [r["nll_minus_native"] for r in csv.DictReader(f)] == ["-0.5", "0", "", ""]
 
 
 def test_benchmark_metrics():

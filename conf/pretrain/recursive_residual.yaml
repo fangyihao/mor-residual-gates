@@ -104,6 +104,8 @@ logging_steps: 100
 dataloader_num_workers: 0
 gradient_checkpointing: false
 track_token_layers: false
+plot_states: false
+plot_hidden_samples: 16
 deepspeed: ds_configs/stage2.config
 evaluation:
   enable: false

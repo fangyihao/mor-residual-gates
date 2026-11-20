@@ -11,7 +11,8 @@ from omegaconf import OmegaConf
 def same_recipe(saved, requested):
     def recipe(cfg):
         values = OmegaConf.to_container(cfg, resolve=True)
-        for key in ("auto_resume", "resume_from_checkpoint", "resume_step", "stop_steps", "ablation_checkpoint_step"):
+        for key in ("auto_resume", "resume_from_checkpoint", "resume_step", "stop_steps", "ablation_checkpoint_step",
+                    "plot_states", "plot_hidden_samples", "logging_steps"):
             values.pop(key, None)
         return values
     return recipe(saved) == recipe(requested)

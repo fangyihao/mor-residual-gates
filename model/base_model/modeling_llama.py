@@ -129,12 +129,17 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
+        observer = getattr(self, "_observe_recursive_update", None)
+        raw_output = hidden_states if observer is not None else None
         stage_gate = getattr(self, "stage_gate", None)
         gate = stage_gate["recursive_gate"] if stage_gate is not None else getattr(self, "recursive_gate", None)
         if gate is not None:
             if isinstance(gate, torch.Tensor):
                 gate = gate.to(block_input.dtype)
             hidden_states = torch.lerp(block_input, hidden_states, gate)
+
+        if observer is not None:
+            observer(block_input, raw_output, hidden_states)
 
         outputs = (hidden_states,)
         if output_attentions:

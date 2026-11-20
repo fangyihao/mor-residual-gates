@@ -1,0 +1,5 @@
+# NeurIPS 2025 Table 3, SmolLM-360M, K=2, fixed-FLOPs row.
+defaults:
+  - 250720_pretrain_smollm-360m_rec2_middle_cycle_random_lr3e-3_mor_expert_linear_alpha_0.1_sigmoid_aux_loss_0.001
+  - paper_mor_settings
+  - _self_

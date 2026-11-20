@@ -1,6 +1,7 @@
 """CPU regression tests using tiny real decoder blocks and deterministic routes."""
 from collections import Counter
 from copy import deepcopy
+import json
 from pathlib import Path
 
 import pytest
@@ -306,6 +307,8 @@ def test_shared_gate_gradient_sums_physical_layer_gradients(router):
 def test_executed_token_layers_per_training_interval(tmp_path, checkpointing):
     model, cfg = tiny_model("rezero_stage", router="expert")
     cfg.track_token_layers = True
+    cfg.plot_states = True
+    cfg.name = "stage_shared_test"
     ids = torch.arange(6)
     args = TrainingArguments(
         output_dir=str(tmp_path), use_cpu=True, per_device_train_batch_size=2, gradient_accumulation_steps=2,
@@ -319,6 +322,30 @@ def test_executed_token_layers_per_training_interval(tmp_path, checkpointing):
         assert row["input_tokens"] == examples * 6
         # Two middle layers see 6, 4 and 2 tokens each. Both bookends see all 6.
         assert row["executed_token_layers"] == examples * (2 * (6 + 4 + 2) + 2 * 6)
+
+        assert row["loss"] == pytest.approx(row["lm_loss"] + row["weighted_aux_loss"], abs=1e-4)
+        assert [row[f"depth/{j}/fraction"] for j in (1, 2, 3)] == pytest.approx([1/3] * 3)
+        assert len([key for key in row if key.startswith("gate/")]) == 2
+        assert len([key for key in row if key.startswith("gate_grad/")]) == 2
+        assert any(key.startswith("hidden/") and value > 0 for key, value in row.items())
+        assert row["optimizer/recursive_gates/weight_decay"] == 0
+    # The first sample precedes any optimizer update. An extra stage can have a
+    # nonzero raw residual while its zero-initialized gate writes back exactly zero.
+    assert rows[0]["hidden/model.layers.2.block.0/raw_update_rms"] > 0
+    assert rows[0]["hidden/model.layers.2.block.0/update_rms"] == 0
+    assert rows[0]["router/model.layers.2/writeback_rms"] == 0
+    assert rows[-1]["cumulative_input_tokens"] == 72
+    path = tmp_path / "training_metrics.jsonl"
+    def records():
+        return [json.loads(line) for line in path.read_text().splitlines()]
+    original = records()
+    assert [r["step"] for r in original if r["event"] == "train"] == [2, 3]
+    assert all(r["k"] == 3 and r["method"] == "rezero_stage" for r in original)
+    with path.open("a") as f:
+        f.write('{"partial":')
+    trainer.plot.on_train_begin(args, trainer.state, trainer.control)
+    assert records() == original
+
 
 
 @pytest.mark.parametrize("router", ["expert", "token"])
