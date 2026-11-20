@@ -37,12 +37,13 @@ from util.misc import print_trainable_parameters, get_latest_checkpoint_path, pr
 def main(cfg: DictConfig):
     npu_device = select_npu()
     residual = cfg.recursive.get("residual")
-    if residual is not None:
+    managed_run = residual is not None or cfg.get("paper_method") is not None
+    if managed_run:
         # Capture CLI overrides before preprocessing derives batch sizes and paths.
         experiment_config = OmegaConf.to_yaml(cfg, resolve=True)
         set_seed(cfg.get("seed", 42))
     cfg = preprocess_config(cfg)
-    if residual is not None:
+    if managed_run:
         run_dir = Path(SAVE_DIR, "pretrain", cfg.output_dir)
         options = dict(routed=cfg.get("mor", {}).get("enable", False),
                        world_size=int(os.environ.get("WORLD_SIZE", 1)), fp16=cfg.precision == "fp16")
@@ -123,7 +124,7 @@ def main(cfg: DictConfig):
         
         if cfg.resume_from_checkpoint:
             if cfg.relaxation.get("enable"):
-                base_checkpoint = cfg.resume_from_checkpoint if residual is not None else get_latest_checkpoint_path(cfg, resume_step=cfg.resume_step if ("resume_step" in cfg and cfg.resume_step is not None) else None)
+                base_checkpoint = cfg.resume_from_checkpoint if managed_run else get_latest_checkpoint_path(cfg, resume_step=cfg.resume_step if ("resume_step" in cfg and cfg.resume_step is not None) else None)
                 load_model_weights(model.get_base_model(), base_checkpoint)
                 
     if "mor" in cfg and cfg.mor.get("enable"):            
@@ -134,6 +135,13 @@ def main(cfg: DictConfig):
         else:
             raise ValueError(f"Unknown MoR type {cfg.mor.type}.")
         
+    if cfg.get("paper_method") and int(os.environ.get("RANK", 0)) == 0:
+        embeddings = {id(module.weight) for module in (model.get_input_embeddings(), model.get_output_embeddings())
+                      if module is not None}
+        counts = {"total": sum(p.numel() for p in model.parameters()),
+                  "non_embedding": sum(p.numel() for p in model.parameters() if id(p) not in embeddings),
+                  "recursive_gates": sum(p.numel() for n, p in model.named_parameters() if n.endswith(".recursive_gate"))}
+        (run_dir / "paper_parameters.json").write_text(json.dumps(counts))
     print_trainable_parameters(model)
         
     report_to = []
@@ -143,7 +151,7 @@ def main(cfg: DictConfig):
         report_to.append("tensorboard")
     
     ds_config = cfg.deepspeed if launcher_type == "deepspeed" else None
-    if ds_config and residual is not None:
+    if ds_config and managed_run:
         # ZeRO wraps the Trainer's grouped AdamW. A DeepSpeed-owned optimizer
         # would put the gates back into the backbone's weight-decayed group.
         with open(ds_config) as f:
@@ -170,7 +178,7 @@ def main(cfg: DictConfig):
         gradient_accumulation_steps=cfg.gradient_accumulation_steps,
         activation_checkpointing=cfg.gradient_checkpointing,
         activation_checkpointing_kwargs={"use_reentrant": False} if cfg.gradient_checkpointing else None,
-        ddp_find_unused_parameters=True if routed and (residual is not None or cfg.gradient_checkpointing) else None,
+        ddp_find_unused_parameters=True if routed and (managed_run or cfg.gradient_checkpointing) else None,
         max_grad_norm=cfg.max_grad_norm,
         dataloader_num_workers=cfg.dataloader_num_workers,
         bf16=cfg.precision == "bf16",
@@ -190,7 +198,7 @@ def main(cfg: DictConfig):
         callbacks.append(EvalCallback(cfg, tokenizer))
     if cfg.relaxation.get("enable") and cfg.relaxation.method in ["lora", "dora", "adaption_prompt"]:
         callbacks.append(PeftSaveCallback(cfg.save_steps, fixed_save_steps=fixed_save_steps))
-    if residual is None and all(ds in LM_DATASETS for ds in cfg.dataset.split(',')):
+    if not managed_run and all(ds in LM_DATASETS for ds in cfg.dataset.split(',')):
         callbacks.append(DatasetSaveCallback(cfg.save_steps, fixed_save_steps=fixed_save_steps))
     if fixed_save_steps is not None:
         callbacks.append(ScalingLawsSaveCallback(fixed_save_steps,))
@@ -201,7 +209,7 @@ def main(cfg: DictConfig):
         trainer_cls = RecursiveTrainer if residual is not None and residual.mode in LEARNED_GATE_MODES else Trainer
         trainer = trainer_cls(model=model, args=train_args, train_dataset=train_dataset, callbacks=callbacks,)
     
-    if residual is not None:
+    if managed_run:
         trainer.add_callback(ResumeCallback(trainer, cfg.resume_from_checkpoint, cfg.get("ablation_checkpoint_step")))
 
     train_result = trainer.train(

@@ -1,0 +1,19 @@
+# NeurIPS 2025 Table 3, SmolLM-360M, three recursions, fixed-FLOPs row.
+defaults:
+  - 250720_pretrain_smollm-360m_rec3_middle_cycle_random_lr3e-3_mor_expert_linear_alpha_0.1_sigmoid_aux_loss_0.001
+  - _self_
+
+name: paper_mor_k${recursive.num_recursion}_${paper_method}_seed${seed}
+paper_method: rezero
+seed: 1234
+auto_resume: true
+wandb: false
+wandb_run_id: null
+wandb_entity: null
+track_token_layers: true
+ablation_checkpoint_step: null
+recursive:
+  residual:
+    mode: rezero
+    lambda_r: 1.0
+    zeta: 1.0

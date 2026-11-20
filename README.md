@@ -70,7 +70,41 @@ model = MoRLlamaForCausalLM.from_pretrained(
 Run the CPU regression suite with `python -m pytest -q tests/test_recursive_residual.py`. It uses tiny local Llama checkpoints to test pretrained preservation, sparse routing, signed gates, fixed coefficients, checkpoint restoration, and optimizer grouping.
 
 
-### Run all five experiments
+### Compare ReZero with the published MoR result
+
+Use `--paper-comparison` for the main experiment. It inherits the authors’ released SmolLM-360M configuration for the **Table 3 fixed-FLOPs, Expert / Cache / Middle-Cycle / K=3** row. The published MoR model has 118M non-embedding parameters and scores **2.7925 FineWeb NLL** and **42.6%** mean downstream accuracy after approximately 30B tokens at $16.5 \times 10^{18}$ training FLOPs. The released recipe trains from scratch on FineWeb-Edu for 14,161 optimizer steps, with 1,024 sequences of 2,048 tokens per global batch (29,697,769,472 input tokens). The pretrained sequence-sharing experiment above addresses the separate question of preserving a pretrained first pass. [Paper, Table 3 and Appendix D](https://papers.nips.cc/paper_files/paper/2025/file/8b08bbf8b420faa6eeb4020720582ec7-Paper-Conference.pdf) · [Released training configuration](https://github.com/raymin0223/mixture_of_recursions/blob/82c97f29cd140efa01f5cc4fe0de73a4c3b6ffd6/conf/pretrain/250720_pretrain_smollm-360m_rec3_middle_cycle_random_lr3e-3_mor_expert_linear_alpha_0.1_sigmoid_aux_loss_0.001.yaml)
+
+| Local method | What the comparison tests |
+|---|---|
+| `original_mor` | Runs the released router-weighted scatter-add update. Compare either ReZero variant with this arm for the overall method effect. |
+| `full` | Writes the selected block output back at full strength. Comparing either ReZero variant with this arm isolates gating under the same writeback rule. |
+| `rezero` | Learns one zero-initialized scalar per physical layer and extra stage. This is the proposed method. |
+| `rezero_stage` | Shares one scalar across physical layers at each extra stage. Comparing it with `rezero` measures the value of layer specificity. |
+
+The default trains each arm on seeds 1234, 1235 and 1236 (12 full runs) with gradient checkpointing and automatic resume. Prepare the model config, tokenizer and both FineWeb datasets as described in this README. Downstream evaluation also requires access to the benchmark datasets or their local cache. The released harness includes legacy dataset loaders. Use `python -m pip install 'datasets==3.6.0'` to reproduce the loader version tested with this suite.
+
+```bash
+# Train and evaluate the main comparison on eight Ascend NPUs
+bash scripts/run_npu.sh all 0,1,2,3,4,5,6,7 --paper-comparison
+
+# Equivalent suite on two GPUs
+bash scripts/pretrain.sh accelerate offline 0,1 all -- --paper-comparison
+
+# Add uniform and power controls at step 3,540 while keeping all four main arms at full length
+bash scripts/run_npu.sh all 0,1,2,3,4,5,6,7 --paper-comparison --ablation-steps 3540
+
+# Score full-budget checkpoints, including a local copy of the authors’ matching native MoR weights
+bash scripts/run_npu.sh all 0,1,2,3,4,5,6,7 --paper-comparison --eval-only \
+  --author-checkpoint /path/to/original-mor-360m-k3-expert-cache
+```
+
+Repeat the original command to resume training. Use `--train-only` to defer evaluation, `--eval-only` to score saved checkpoints at the requested step, or `--nll-only` to defer downstream scoring. Repeat the same training overrides in evaluation-only mode. For a separate pilot, use a distinct `name=...` prefix. The optional authors’ checkpoint directory accepts Hugging Face safetensors or PyTorch weights, including shards. Select the fixed-FLOPs K=3 checkpoint from the authors’ release and retain its provenance. The runner records the supplied weight hashes. [Authors’ checkpoint release](https://drive.google.com/drive/folders/1pYKJOu2aBGC-jgoWbfP6T_vqEYtUVxa4?usp=drive_link)
+
+The default output `paper_mor_fineweb.paper.md` contains the reported MoR row and the local means, sample standard deviations, seed counts and measured training tokens. The adjacent `.paper.json` includes per-seed results, paired differences, trainable gate counts, executed token-layers and differences from the released training recipe. The optional shorter panel scores all six local methods at the same early step on FineWeb, and writes the downstream results and paper table at the full step. Use the full-budget paired results for end-of-training claims. Token-layers measure routed work. An equal-FLOPs or latency claim requires separate measurement.
+
+The scorer fingerprints the ordered FineWeb token IDs for the same finite prefix (500 packed sequences by default). Downstream evaluation uses LAMBADA, HellaSwag, PIQA, WinoGrande, ARC and MMLU continuation. ARC averages Easy and Challenge equally, and the overall mean gives each of the six task families equal weight. HellaSwag, PIQA and both ARC tasks use target byte-length normalization. The released task definitions resolve to zero shots by default. Appendix D does not give per-task shot counts or identify the precise held-out prefix. The report records the local shot counts, sample counts and task versions. If an evaluation setting is independently confirmed, `--benchmark-shots TASK=N` applies it to every arm, including the supplied authors’ checkpoint. Interpret paper-to-local gaps in light of this calibration. The released expert-choice router selects tokens across the sequence, so these scores describe offline held-out scoring. Claims about strictly causal decoding require a separate evaluation.
+
+### Run all five pretrained experiments
 
 The `all` option trains `rezero`, `rezero_stage`, `full`, `uniform` and `power` sequentially for each of three paired seeds (1234, 1235 and 1236). The default suite uses $K=8$, gradient checkpointing and token-layer tracking. After all 15 training runs finish, it evaluates every checkpoint on the same 200 packed FineWeb samples. A failed run stops the suite and returns a nonzero exit status.
 
@@ -104,7 +138,7 @@ bash scripts/run_npu.sh all 0,1,2,3,4,5,6,7 --ablation-steps 3540 name=short_abl
 # Re-score the saved checkpoints at both budgets
 bash scripts/run_npu.sh all 0,1,2,3,4,5,6,7 --ablation-steps 3540 name=short_ablation --eval-only
 
-# Use full-strength MoR as the full-budget control on two GPUs
+# Use the full-strength residual update as the full-budget control on two GPUs
 bash scripts/pretrain.sh accelerate offline 0,1 all -- --ablation-steps 3540 --full-budget-control full name=mor_control
 ```
 
@@ -112,7 +146,7 @@ With the preset’s 14,161-step full budget, this example uses **38,942 optimize
 
 The default outputs in the example are `residual_suite_fineweb.step-3540.json` (five methods) and `residual_suite_fineweb.full-step-14161.json` (two methods). With `--output-file pilot.json`, the files are `pilot.json` and `pilot.full-step-14161.json`. Console output includes checkpoint steps, per-seed NLL differences and, when tracking is enabled, input tokens and executed token-layers. With at least two paired seeds it reports the mean and sample standard deviation of the paired differences. A weights-only `ablation-step-S/` snapshot survives ordinary checkpoint rotation, including `save_total_limit=1`. Resume and evaluation-only commands use the same suite arguments and training overrides. Changed budgets can reuse an exact saved checkpoint. A run that has passed S without retaining it requires a different saved comparison step or a fresh run.
 
-For a paper, report the five-way comparison at S and the paired full-budget comparison in separate rows or tables. Report variability across seeds and the observed token-layer work. The short run tests how much a design helps by S. For a claim about the benefit of layer-specific gates at the end of training, use the full-budget layer-specific versus stage-shared pair. For a full-budget claim against original MoR, select `--full-budget-control full`. [NeurIPS guidance on empirical claims and reporting](https://neurips.cc/public/guides/PaperChecklist)
+For a paper, report the five-way comparison at S and the paired full-budget comparison in separate rows or tables. Report variability across seeds and the observed token-layer work. The short run tests how much a design helps by S. For a claim about the benefit of layer-specific gates at the end of training, use the full-budget layer-specific versus stage-shared pair. Use the `--paper-comparison` preset above for a full-budget comparison with the original MoR update. [NeurIPS guidance on empirical claims and reporting](https://neurips.cc/public/guides/PaperChecklist)
 
 The preset gives each mode and seed its own checkpoint directory. A literal `name=pilot` or `output_dir=pilot` becomes a prefix, for example `pilot_rezero_stage_seed1234`. Use the same prefix and seeds on restart.
 

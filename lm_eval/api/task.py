@@ -80,6 +80,7 @@ class TaskConfig(dict):
     use_prompt: Optional[str] = None
     description: str = ""
     target_delimiter: str = " "
+    normalize_choice_by_bytes: bool = False
     fewshot_delimiter: str = "\n\n"
     fewshot_config: Optional[dict] = None
     # runtime configuration options
@@ -1411,7 +1412,8 @@ class ConfigurableTask(Task):
 
             # retrieve choices in List[str] form, to compute choice lengths, etc.
             choices = self.doc_to_choice(doc)
-            completion_len = np.array([float(len(i)) for i in choices])
+            length = self.count_bytes if self.config.normalize_choice_by_bytes else len
+            completion_len = np.array([float(length(choice)) for choice in choices])
 
             if (
                 2 * len(choices) == len(lls)

@@ -1,6 +1,7 @@
 from util.checkpoint import load_model_weights
 from util.resume import evaluation_weights
 import os
+import hashlib
 from itertools import islice
 import yaml
 import copy
@@ -55,7 +56,7 @@ LM_DATASETS = {
 }
 
 
-def load_dataset_from_config(cfg, tokenizer):
+def load_dataset_from_config(cfg, tokenizer, continuous=True):
     dataset_name_str = cfg.dataset # cfg.dataset might be a string or already a list
     if isinstance(dataset_name_str, str):
         dataset_names = [ds.strip() for ds in dataset_name_str.split(',')]
@@ -97,7 +98,7 @@ def load_dataset_from_config(cfg, tokenizer):
 
     if dataset_type == "lm":
         return LanguageModelingDataset(final_dataset, tokenizer,
-                                    max_length=cfg.max_length,
+                                    max_length=cfg.max_length, continuous=continuous,
                                     transforms=transforms,
                                     global_shuffling=cfg.get("global_shuffling", False),
                                     local_shuffling=cfg.get("local_shuffling", False),
@@ -113,31 +114,10 @@ def evaluation_state():
     return PartialState(cpu=not torch.cuda.is_available())
 
 
-def evaluate_model(exp_name: str, global_sample_number: int, state=None, attn_implementation=None, strict=False, latest_saved=False, weights_dir=None) -> Optional[float]:
-    """Score the same packed sample prefix for any number of data-parallel workers."""
-    if state is None:
-        state = evaluation_state()
-    print(f"Evaluating experiment: {exp_name}")
-    cfg_path = training_config_path(os.path.join(SAVE_DIR, "pretrain", exp_name), "conf/pretrain")
-    if not os.path.exists(cfg_path):
-        if strict or state.num_processes > 1:
-            raise FileNotFoundError(cfg_path)
-        print(f"Configuration file not found for {exp_name} at {cfg_path}. Skipping.")
-        return None
-
-    cfg = OmegaConf.load(cfg_path)
-    cfg = preprocess_config(cfg) # This should handle setting default max_length if not present
-
-    cfg.resume_from_checkpoint = False
-    if attn_implementation is not None:
-        cfg.attn_implementation = attn_implementation
-    elif state.device.type == "npu" and cfg.get("attn_implementation", "flash_attention_2") == "flash_attention_2":
-        cfg.attn_implementation = "sdpa"
-    
+def load_scoring_model(cfg, run_dir, checkpoint_dir):
+    """Build the saved architecture before loading native or residual-gated weights."""
     model = load_model_from_config(cfg)
-    
-    run_dir = Path(SAVE_DIR, "pretrain", exp_name)
-    checkpoint_dir = Path(weights_dir) if weights_dir else (evaluation_weights(run_dir) if latest_saved else run_dir)
+
     lora_init_dict = None # Initialize lora_init_dict
 
     if cfg.recursive.get("enable"):
@@ -166,14 +146,48 @@ def evaluate_model(exp_name: str, global_sample_number: int, state=None, attn_im
         else:
             raise ValueError(f"Unknown MoR type {cfg.mor.type}.")
 
+    load_model_weights(model, checkpoint_dir)
+    return model
+
+
+def fingerprint_prefix(dataset, size, digest):
+    for sample in islice(dataset, size):
+        ids = sample["input_ids"].detach().cpu().numpy().astype("<i8", copy=False)
+        digest.update(len(ids).to_bytes(8, "little"))
+        digest.update(ids.tobytes())
+        yield sample
+
+
+def evaluate_model(exp_name: str, global_sample_number: int, state=None, attn_implementation=None, strict=False, latest_saved=False, weights_dir=None, data_manifest=None) -> Optional[float]:
+    """Score the same packed sample prefix for any number of data-parallel workers."""
+    if state is None:
+        state = evaluation_state()
+    print(f"Evaluating experiment: {exp_name}")
+    cfg_path = training_config_path(os.path.join(SAVE_DIR, "pretrain", exp_name), "conf/pretrain")
+    if not os.path.exists(cfg_path):
+        if strict or state.num_processes > 1:
+            raise FileNotFoundError(cfg_path)
+        print(f"Configuration file not found for {exp_name} at {cfg_path}. Skipping.")
+        return None
+
+    cfg = OmegaConf.load(cfg_path)
+    cfg = preprocess_config(cfg) # This should handle setting default max_length if not present
+
+    cfg.resume_from_checkpoint = False
+    if attn_implementation is not None:
+        cfg.attn_implementation = attn_implementation
+    elif state.device.type == "npu" and cfg.get("attn_implementation", "flash_attention_2") == "flash_attention_2":
+        cfg.attn_implementation = "sdpa"
+
+    run_dir = Path(SAVE_DIR, "pretrain", exp_name)
+    checkpoint_dir = Path(weights_dir) if weights_dir else (evaluation_weights(run_dir) if latest_saved else run_dir)
     try:
-        load_model_weights(model, checkpoint_dir)
+        model = load_scoring_model(cfg, run_dir, checkpoint_dir)
         print(f"Loaded experiment weights from {checkpoint_dir}")
     except (FileNotFoundError, RuntimeError) as exc:
         if strict or state.num_processes > 1:
             raise
         warnings.warn(f"Skipping {exp_name}: {exc}")
-        del model
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         return None
@@ -183,7 +197,10 @@ def evaluate_model(exp_name: str, global_sample_number: int, state=None, attn_im
     cfg_for_dataset.dataset = "fineweb_test"
 
     tokenizer = load_tokenizer_from_config(cfg_for_dataset)
-    dataset = load_dataset_from_config(cfg_for_dataset, tokenizer)
+    dataset = load_dataset_from_config(cfg_for_dataset, tokenizer, continuous=data_manifest is None)
+    if data_manifest is not None and state.is_main_process:
+        digest = hashlib.sha256()
+        dataset = fingerprint_prefix(dataset, global_sample_number, digest)
 
     device = state.device
     model.to(device, dtype=get_torch_dtype(cfg))
@@ -219,6 +236,9 @@ def evaluate_model(exp_name: str, global_sample_number: int, state=None, attn_im
         raise ValueError(f"{exp_name} scored {count} of {global_sample_number} requested samples")
     if count == 0:
         return None
+    if data_manifest is not None and state.is_main_process:
+        data_manifest.update(packed_sequences=count, sequence_length=cfg.max_length,
+                             input_ids_sha256=digest.hexdigest(), tokenizer=cfg.tokenizer)
     avg_loss = total_loss.item() / count
     if strict and not math.isfinite(avg_loss):
         raise ValueError(f"{exp_name} produced non-finite FineWeb loss {avg_loss}")
@@ -249,12 +269,19 @@ def main():
         help="Path to save the JSON file with evaluation results."
     )
 
+    parser.add_argument("--exp-labels", nargs="+", help="unique output keys in --exp_names order")
+    parser.add_argument("--data-manifest", type=Path, help="score a finite prefix and record its packed-token digest")
     parser.add_argument("--attn_implementation", choices=("eager", "sdpa", "flash_attention_2"))
     weights = parser.add_mutually_exclusive_group()
     weights.add_argument("--checkpoint-dirs", nargs="+", help="explicit weight directories in --exp_names order")
     weights.add_argument("--latest-saved", action="store_true", help="score the latest usable weights of each run, including interrupted runs")
     parser.add_argument("--strict", action="store_true", help="require a finite loss on every requested sample")
     args = parser.parse_args()
+    if args.data_manifest:
+        args.strict = True
+    labels = args.exp_labels or args.exp_names
+    if len(labels) != len(args.exp_names) or len(set(labels)) != len(labels):
+        parser.error("Supply one unique result label per experiment")
     if args.checkpoint_dirs and len(args.checkpoint_dirs) != len(args.exp_names):
         parser.error("--checkpoint-dirs needs one entry per experiment")
     if args.sample_number < 0:
@@ -275,15 +302,23 @@ def main():
 
     all_results: Dict[str, Optional[float]] = {} # Initialize dictionary to store all results
 
-    for exp_name, weights_dir in zip(experiment_names, args.checkpoint_dirs or [None] * len(experiment_names)):
+    manifests = {}
+    for exp_name, label, weights_dir in zip(experiment_names, labels, args.checkpoint_dirs or [None] * len(labels), strict=True):
+        data = {} if args.data_manifest else None
         loss = evaluate_model(exp_name, global_sample_number, state, args.attn_implementation,
-                              args.strict, args.latest_saved, weights_dir)
-        all_results[exp_name] = loss # loss can be float or None
+                              args.strict, args.latest_saved, weights_dir, data)
+        if data is not None:
+            manifests[label] = data
+        all_results[label] = loss # loss can be float or None
         print("-" * 70)
 
     if not state.is_main_process:
         return
 
+    if args.data_manifest:
+        if len({m["input_ids_sha256"] for m in manifests.values()}) != 1:
+            raise ValueError("The compared models received different packed validation tokens")
+        args.data_manifest.write_text(json.dumps(manifests, indent=2) + "\n")
     # Save the results to a JSON file
     try:
         with open(output_file_path, 'w') as f:

@@ -62,7 +62,7 @@ def preprocess_config(cfg: DictConfig):
         print(f"Setting output_dir  : {cfg.name}")
         cfg.output_dir = cfg.name
     
-    if cfg.get("recursive", {}).get("residual") is None and check_saved_checkpoint(cfg, SAVE_DIR):
+    if cfg.get("recursive", {}).get("residual") is None and not cfg.get("paper_method") and check_saved_checkpoint(cfg, SAVE_DIR):
         cfg.resume_from_checkpoint = True
         warnings.warn("Resume from latest checkpoint. If you want to train from scratch, please delete the checkpoint directory.")
         
