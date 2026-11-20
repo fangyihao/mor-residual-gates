@@ -16,24 +16,27 @@ def test_paper_recipes_and_control_budgets():
     methods = (*PAPER_METHODS, "uniform", "power", "original_mor")
     runs = plan("paper_mor", [], [1234], 512)
     assert {(r.config.recursive.num_recursion, r.mode) for r in runs} == {
-        (k, method) for k in (2, 3, 4) for method in methods}
+        (k, method) for k in (3, 4, 6) for method in methods}
     assert len(runs) == 15
     for run in runs:
         cfg = run.config
         k = cfg.recursive.num_recursion
-        released = RELEASED_CONFIG.replace("_rec3_", f"_rec{k}_")
+        released = RELEASED_CONFIG if k in (3, 6) else RELEASED_CONFIG.replace("_rec3_", "_rec4_")
         reference = OmegaConf.to_container(OmegaConf.load(ROOT / "conf/pretrain" / (released + ".yaml")))
         with initialize_config_dir(config_dir=str(ROOT / "conf/pretrain"), version_base=None):
             assert compose(run.preset, overrides=run.overrides) == cfg
         assert cfg.seed == 1234 and cfg.paper_method == run.mode
         assert cfg.name == f"paper_mor_k{k}_{run.mode}_seed1234"
+        if k == 6:
+            # K=6 inherits every scientific setting from K=3 except the depth.
+            reference["recursive"]["num_recursion"] = 6
         assert not recipe_changes(cfg, reference)
         assert cfg.use_pretrained_weights is False and cfg.recursive.sharing == "middle_cycle"
         if run.mode == "original_mor":
             assert cfg.recursive.residual is None
         else:
             assert cfg.recursive.residual.mode == run.mode
-        assert cfg.num_train_steps == {2: 12619, 3: 14161, 4: 14216}[k]
+        assert cfg.num_train_steps == {3: 14161, 4: 14216, 6: 14161}[k]
         if k == 4:
             assert cfg.model_config.num_hidden_layers == 34
         assert cfg.ablation_checkpoint_step == 512
@@ -43,7 +46,7 @@ def test_paper_recipes_and_control_budgets():
 
 
 def test_select_ablation_depths_and_pair_csv(tmp_path):
-    runs = plan("paper_mor", ["name=pilot_${paper_method}_${seed}"], [31], 128, ablation_ks=[2, 4])
+    runs = plan("paper_mor", ["name=pilot_${paper_method}_${seed}"], [31], 128, ablation_ks=[4, 6])
     assert len({r.directory for r in runs}) == 12
     assert all(r.config.get("ablation_checkpoint_step") is None for r in runs[:2])
     assert all(training_target(r.config) == 128 for r in runs[2:])
@@ -55,6 +58,12 @@ def test_select_ablation_depths_and_pair_csv(tmp_path):
     write_ablation_csv(path, rows)
     with path.open() as f:
         assert [r["nll_minus_native"] for r in csv.DictReader(f)] == ["-0.5", "0", "", ""]
+
+
+def test_existing_k2_ablations_remain_addressable():
+    runs = plan("paper_mor", [], [1234], 256, ablations_only=True, ablation_ks=[2])
+    assert len(runs) == 5
+    assert all(r.preset == "paper_mor_k2" and r.directory == f"paper_mor_k2_{r.mode}_seed1234" for r in runs)
 
 
 def test_benchmark_metrics():

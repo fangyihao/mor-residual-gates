@@ -233,7 +233,7 @@ def test_npu_paper_matrix(launch, options, short_step, only):
     methods = ["rezero", "rezero_stage"]
     if short_step:
         methods += ["uniform", "power", "original_mor"]
-    depths = [3, 2, 4] if short_step else [3]
+    depths = [3, 4, 6] if short_step else [3]
     pairs = [(k, method) for k in depths for method in methods]
     for (_, args, _), (k, method) in zip(calls, pairs, strict=True):
         assert args[args.index("--config-name") + 1] == ("paper_mor" if k == 3 else f"paper_mor_k{k}")

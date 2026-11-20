@@ -1,0 +1,7 @@
+# Local six-stage depth ablation using the released K=3 training recipe.
+defaults:
+  - paper_mor
+  - _self_
+
+recursive:
+  num_recursion: 6

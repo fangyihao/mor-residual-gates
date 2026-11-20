@@ -19,6 +19,8 @@ from util.resume import checkpoint_step, evaluation_weights, has_weights, same_r
 
 MODES = ("rezero", "rezero_stage", "full", "uniform", "power")
 PAPER_METHODS = ("rezero", "rezero_stage")
+PAPER_PRESETS = {2: "paper_mor_k2", 3: "paper_mor", 4: "paper_mor_k4", 6: "paper_mor_k6"}
+DEFAULT_ABLATION_KS = (3, 4, 6)
 DEFAULT_SEEDS = (1234, 1235, 1236)
 
 
@@ -58,13 +60,13 @@ def plan(config_name, overrides, seeds, ablation_steps=None, full_budget_control
 
     with initialize_config_dir(config_dir=str(ROOT / "conf/pretrain"), version_base=None):
         main_k = compose(config_name, overrides=overrides).recursive.num_recursion
-    main_preset = f"paper_mor_k{main_k}" if main_k in (2, 4) else config_name
+    main_preset = PAPER_PRESETS.get(main_k, config_name)
     if ablation_steps is None:
         return plan_depth(main_preset, overrides, seeds, None, full_budget_control, ablations_only)
     sets_depth = any(a.partition("=")[0].lstrip("+~") == "recursive.num_recursion" for a in overrides)
-    depths = list(ablation_ks) if ablation_ks is not None else ([main_k] if sets_depth else [2, 3, 4])
-    if not depths or len(depths) != len(set(depths)) or any(k not in (2, 3, 4) and k != main_k for k in depths):
-        raise ValueError("--ablation-ks takes distinct released depths 2,3,4 or the configured main depth")
+    depths = list(ablation_ks) if ablation_ks is not None else ([main_k] if sets_depth else DEFAULT_ABLATION_KS)
+    if not depths or len(depths) != len(set(depths)) or any(k not in PAPER_PRESETS and k != main_k for k in depths):
+        raise ValueError(f"--ablation-ks takes distinct preset depths from {list(PAPER_PRESETS)} or the configured main depth")
     runs = []
     if not ablations_only or main_k in depths:
         runs += plan_depth(main_preset, overrides, seeds, ablation_steps if main_k in depths else None,
@@ -73,7 +75,7 @@ def plan(config_name, overrides, seeds, ablation_steps=None, full_budget_control
         if k == main_k:
             continue
         common = [a for a in overrides if a.partition("=")[0].lstrip("+~") != "recursive.num_recursion"]
-        preset = "paper_mor" if k == 3 else f"paper_mor_k{k}"
+        preset = PAPER_PRESETS[k]
         runs += plan_depth(preset, common, seeds, ablation_steps, full_budget_control, True, extra_k=k)
     directories = {(ROOT / "results/pretrain" / r.directory).resolve() for r in runs}
     if len(directories) != len(runs):
@@ -83,7 +85,7 @@ def plan(config_name, overrides, seeds, ablation_steps=None, full_budget_control
 
 def plan_depth(config_name, overrides, seeds, ablation_steps, full_budget_control, ablations_only, extra_k=None):
     keys = {arg.partition("=")[0].lstrip("+~") for arg in overrides}
-    paper = config_name in {"paper_mor", "paper_mor_k2", "paper_mor_k4"}
+    paper = config_name in PAPER_PRESETS.values()
     if ablations_only and (not paper or ablation_steps is None):
         raise ValueError("--ablations-only requires --paper-comparison and --ablation-steps")
     if paper and full_budget_control is not None:
@@ -189,7 +191,7 @@ def main():
     parser.add_argument("--ablation-steps", type=int, metavar="S",
                         help="stop auxiliary runs at S optimizer updates and score all modes at S")
     parser.add_argument("--ablation-ks", type=seed_list, metavar="K,...",
-                        help="depths for the short paper panel (default 2,3,4)")
+                        help=f"depths for the short paper panel (default {','.join(map(str, DEFAULT_ABLATION_KS))})")
     parser.add_argument("--ablations-only", action="store_true",
                         help="run only the short paper panel (default 512 steps)")
     parser.add_argument("--full-budget-control", choices=(*MODES[1:], "none"),

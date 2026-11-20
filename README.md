@@ -99,9 +99,9 @@ bash scripts/run_npu.sh all 0,1,2,3,4,5,6,7 --paper-comparison --eval-only \
   --author-checkpoint /path/to/original-mor-360m-k3-expert-cache
 ```
 
-The **main comparison uses $K=3$**. The **short ablations use $K=2,3,4$**. Here $K$ counts the first execution and all possible extra executions. Each depth inherits its released Table 3 fixed-FLOPs recipe, including the 34 virtual layers at $K=4$. Within each depth, every short run uses the same initialization recipe, seed, input-token budget, router capacities and learning-rate schedule. Across depths the physical model size and executed work also change.
+The **main comparison uses $K=3$**. The **short ablations use $K=3,4,6$**. Here $K$ counts the first execution and all possible extra executions. The $K=3$ and $K=4$ settings use their released Table 3 recipes, including 34 virtual layers at $K=4$. The local $K=6$ extension inherits the $K=3$ training recipe. With two unshared end layers, the 32-layer SmolLM-360M backbone has a body of 30 virtual layers, which gives five physical blocks reused six times. Within each depth, every short run uses the same initialization recipe, seed, input-token budget, router capacities and learning-rate schedule. Across depths the physical model size and executed work also change. [SmolLM-360M model configuration](https://huggingface.co/HuggingFaceTB/SmolLM-360M/blob/main/config.json)
 
-| Method | Short FineWeb evaluation at each of $K=2,3,4$ | Full FineWeb and downstream at $K=3$ |
+| Method | Short FineWeb evaluation at each of $K=3,4,6$ | Full FineWeb and downstream at $K=3$ |
 |---|---:|---:|
 | Layer-specific ReZero | Step 512 | Step 14,161 |
 | Stage-shared ReZero | Step 512 | Step 14,161 |
@@ -109,11 +109,11 @@ The **main comparison uses $K=3$**. The **short ablations use $K=2,3,4$**. Here 
 | Power-law scaling | Step 512 | — |
 | Native MoR (released router-weighted writeback) | Step 512 | Published reference |
 
-At the default $\Lambda_R=1$ and $\zeta=1$, the two fixed schedules coincide at $K=2$ because there is only one extra execution. The two runs check reproducibility. The $K=3$ and $K=4$ pairs test the effect of distributing the update strength across stages.
+At the default decay exponent of one, uniform and power-law scaling differ at all three depths. At $K=6$ the ReZero variants have five extra stages after the ungated first execution. The layer-specific model learns 25 gates (five physical blocks times five extra stages), and the stage-shared model learns five. Compare the $K=6$ methods against the locally trained native MoR run at the same depth and token budget.
 
 The combined command uses 15 trajectories per seed. The first 512 updates of the two main $K=3$ runs also supply their short-panel checkpoints. The other 13 trajectories stop at 512. At the released batch size this is 1,073,741,824 training tokens per short measurement, including 86 warmup updates. Report these results as early-training NLL. The shorter panel supports within-depth comparisons of optimization and representation drift. Use the full runs for end-of-training claims. Native MoR retains the authors’ router-weighted additive writeback. Its comparison with ReZero includes the change in writeback as well as residual scaling.
 
-To reduce the budget further, specify e.g. `--ablations-only --ablation-steps 256` (536,870,912 tokens per trajectory), or select depths with `--ablation-ks 2,4`. Use the combined command from the start to retain the exact early checkpoint, or run the short panel first and repeat the command without `--ablations-only`, explicitly supplying the same `--ablation-steps`, to continue both main models. An existing long run can supply the short measurement if it retained weights at the requested step.
+To reduce the budget further, specify e.g. `--ablations-only --ablation-steps 256` (536,870,912 tokens per trajectory), or select just the deeper settings with `--ablation-ks 4,6`. Earlier $K=2$ runs remain selectable with `--ablation-ks 2`. Use the combined command from the start to retain the exact early checkpoint, or run the short panel first and repeat the command without `--ablations-only`, explicitly supplying the same `--ablation-steps`, to continue both main models. An existing long run can supply the short measurement if it retained weights at the requested step.
 
 Repeat the original command to resume training. Use `--train-only` to defer evaluation, `--eval-only` to score saved checkpoints at the requested step, or `--nll-only` to defer downstream scoring. Repeat the same training overrides in evaluation-only mode. For a separate pilot, use a distinct `name=...` prefix. The optional authors’ checkpoint directory accepts Hugging Face safetensors or PyTorch weights, including shards. Select the fixed-FLOPs K=3 checkpoint from the authors’ release and retain its provenance. The runner records the supplied weight hashes. [Authors’ checkpoint release](https://drive.google.com/drive/folders/1pYKJOu2aBGC-jgoWbfP6T_vqEYtUVxa4?usp=drive_link)
 
