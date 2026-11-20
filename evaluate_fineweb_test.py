@@ -1,4 +1,5 @@
 from util.checkpoint import load_model_weights
+from util.resume import evaluation_weights
 import os
 from itertools import islice
 import yaml
@@ -112,7 +113,7 @@ def evaluation_state():
     return PartialState(cpu=not torch.cuda.is_available())
 
 
-def evaluate_model(exp_name: str, global_sample_number: int, state=None, attn_implementation=None, strict=False) -> Optional[float]:
+def evaluate_model(exp_name: str, global_sample_number: int, state=None, attn_implementation=None, strict=False, latest_saved=False, weights_dir=None) -> Optional[float]:
     """Score the same packed sample prefix for any number of data-parallel workers."""
     if state is None:
         state = evaluation_state()
@@ -135,6 +136,8 @@ def evaluate_model(exp_name: str, global_sample_number: int, state=None, attn_im
     
     model = load_model_from_config(cfg)
     
+    run_dir = Path(SAVE_DIR, "pretrain", exp_name)
+    checkpoint_dir = Path(weights_dir) if weights_dir else (evaluation_weights(run_dir) if latest_saved else run_dir)
     lora_init_dict = None # Initialize lora_init_dict
 
     if cfg.recursive.get("enable"):
@@ -148,7 +151,9 @@ def evaluate_model(exp_name: str, global_sample_number: int, state=None, attn_im
     if cfg.get("relaxation") and cfg.relaxation.get("enable"):
         model = relax_weight_sharing(cfg, model, lora_init_dict=lora_init_dict)
 
-        if cfg.get("resume_from_checkpoint"): # Check if resume_from_checkpoint is True
+        if checkpoint_dir != run_dir:
+            load_model_weights(model.get_base_model(), checkpoint_dir)
+        elif cfg.get("resume_from_checkpoint"): # Check if resume_from_checkpoint is True
             latest_checkpoint_path_obj = get_latest_checkpoint_path(cfg, resume_step=cfg.resume_step if ("resume_step" in cfg and cfg.resume_step is not None) else None)
             if latest_checkpoint_path_obj:
                 load_model_weights(model.get_base_model(), latest_checkpoint_path_obj)
@@ -161,8 +166,6 @@ def evaluate_model(exp_name: str, global_sample_number: int, state=None, attn_im
         else:
             raise ValueError(f"Unknown MoR type {cfg.mor.type}.")
 
-    # Define checkpoint paths for the main experiment
-    checkpoint_dir = os.path.join(SAVE_DIR, "pretrain", exp_name)
     try:
         load_model_weights(model, checkpoint_dir)
         print(f"Loaded experiment weights from {checkpoint_dir}")
@@ -247,8 +250,13 @@ def main():
     )
 
     parser.add_argument("--attn_implementation", choices=("eager", "sdpa", "flash_attention_2"))
+    weights = parser.add_mutually_exclusive_group()
+    weights.add_argument("--checkpoint-dirs", nargs="+", help="explicit weight directories in --exp_names order")
+    weights.add_argument("--latest-saved", action="store_true", help="score the latest usable weights of each run, including interrupted runs")
     parser.add_argument("--strict", action="store_true", help="require a finite loss on every requested sample")
     args = parser.parse_args()
+    if args.checkpoint_dirs and len(args.checkpoint_dirs) != len(args.exp_names):
+        parser.error("--checkpoint-dirs needs one entry per experiment")
     if args.sample_number < 0:
         parser.error("--sample_number must be nonnegative")
     if args.strict and args.sample_number == 0:
@@ -267,8 +275,9 @@ def main():
 
     all_results: Dict[str, Optional[float]] = {} # Initialize dictionary to store all results
 
-    for exp_name in experiment_names:
-        loss = evaluate_model(exp_name, global_sample_number, state, args.attn_implementation, args.strict)
+    for exp_name, weights_dir in zip(experiment_names, args.checkpoint_dirs or [None] * len(experiment_names)):
+        loss = evaluate_model(exp_name, global_sample_number, state, args.attn_implementation,
+                              args.strict, args.latest_saved, weights_dir)
         all_results[exp_name] = loss # loss can be float or None
         print("-" * 70)
 

@@ -1,10 +1,11 @@
-from typing import List, Iterator, Dict, Any
+from typing import Iterator, Dict, Any
 
-import random
+from collections import deque
+from copy import deepcopy
+from itertools import islice
 import numpy as np
 import torch
 from torch.utils.data import IterableDataset
-from datasets import Dataset
 from transformers import PreTrainedTokenizer
 
 from lm_dataset.util import load_python_edu_text
@@ -24,7 +25,9 @@ class LanguageModelingDataset(IterableDataset):
         self.transforms = transforms
         self.global_shuffling = global_shuffling
         self.local_shuffling = local_shuffling
-        self.rng = random.Random(seed)
+        self.track_position = False
+        self.consumed = 0
+        self._chunks = deque()
 
         if self.tokenizer.padding_side == "left":
             raise ValueError("The tokenizer padding side must be right.")
@@ -42,143 +45,116 @@ class LanguageModelingDataset(IterableDataset):
         # Not the actual number of packed samples
         return len(self.dataset)
 
-    def state_dict(self) -> Dict[str, Any]:
-        """Save the iteration state"""
-        return {
-            "epoch": getattr(self, 'epoch', 0),
-            "iter_step": getattr(self, 'iter_step', 0),
-            "token_buffer": getattr(self, 'token_buffer', []),
-            "full_samples": getattr(self, 'full_samples', None),
-            "full_samples_idx": getattr(self, 'full_samples_idx', 0),
-            "total_yield_index": getattr(self, 'total_yield_index', 0),
-        }
+    def commit_position(self, consumed):
+        """Discard chunks strictly before the next example needed by the trainer."""
+        self.consumed = consumed
+        while len(self._chunks) > 1 and self._chunks[1]["start"] <= consumed:
+            self._chunks.popleft()
+
+    def state_dict(self, consumed=None) -> Dict[str, Any]:
+        """Snapshot the next unconsumed packed sample, independent of loader prefetch."""
+        if consumed is None:
+            consumed = self.total_yield_index
+        self.commit_position(consumed)
+        chunk = self._chunks[0]
+        offset = consumed - chunk["start"]
+        if not 0 <= offset <= len(chunk["samples"]):
+            raise ValueError(f"Packed position {consumed} is outside the retained chunk")
+        return {**chunk, "offset": offset}
 
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
-        """Load the iteration state"""
         self._loaded_state = state_dict
 
-    def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:       
-        data_remaining = True
-        dataset = self.dataset
-        if self.local_shuffling:
-            local_rng = np.random.RandomState(self.seed)
-        buffer: List[str] = []
-        current_buffer_size: int = 0  # in number of characters
-            
-        if self._loaded_state is None:
-            self.epoch, self.iter_step = 0, 0
-            self.token_buffer: List[int] = []
-            self.full_samples = None
-            self.full_samples_idx, self.total_yield_index = 0, 0
-            self.resume = False
+    def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
+        saved, self._loaded_state = self._loaded_state, None
+        self._chunks.clear()
+        epoch = saved["epoch"] if saved else 0
+        document = saved["document"] if saved else 0
+        carry = saved["carry"] if saved else []
+        local_rng = np.random.RandomState(self.seed)
+        if saved and self.local_shuffling:
+            algorithm, keys, pos, has_gauss, cached_gaussian = saved["shuffle_state"]
+            local_rng.set_state((algorithm, np.asarray(keys, dtype=np.uint32), pos, has_gauss, cached_gaussian))
+
+        def source_for_epoch():
+            return self.dataset.shuffle(seed=self.seed + epoch) if self.global_shuffling else self.dataset
+
+        source = source_for_epoch()
+        if saved and saved["source_state"] is not None:
+            # HF remembers a loaded state on subsequent iterations. Only the current epoch resumes.
+            source = deepcopy(source)
+            source.load_state_dict(saved["source_state"])
+            iterator = iter(source)
         else:
-            self.epoch = self._loaded_state["epoch"]
-            self.iter_step = self._loaded_state["iter_step"]
-            self.token_buffer = self._loaded_state["token_buffer"]
-            self.full_samples = self._loaded_state["full_samples"]
-            self.full_samples_idx = self._loaded_state["full_samples_idx"]
-            self.total_yield_index = self._loaded_state["total_yield_index"]
-            self.resume = True
-                
-        if self.global_shuffling:
-            dataset = self.dataset.suffle(seed=self.seed + self.epoch)
-        iterator = iter(dataset)    
-        
-        if self.iter_step > 0:            
-            # Skip to the last loaded sample
-            for _ in range(self.iter_step):
-                next(iterator)
-        
-        while data_remaining:
-            if not self.resume:
-                # Fill text buffer
-                while current_buffer_size < self.buffer_size:
-                    try:
-                        sample = next(iterator); self.iter_step += 1
-                        
-                        if "blob_id" in sample:
-                            # in case of python-edu dataset, we need to load decoded text files
-                            sample = load_python_edu_text(sample)
-                            if sample["download_success"]:
-                                sample = sample["text"]
-                            else:
-                                continue
-                        else:
-                            sample = sample["text"]
-                        
-                        if not self.add_bos_token:
-                            sample = sample + self.tokenizer.eos_token
-                        else:
-                            sample = sample + self.tokenizer.bos_token
-                        buffer.append(sample)
-                        current_buffer_size += len(sample)
-                    except StopIteration:
-                        if self.continuous:
-                            self.epoch += 1
-                            if self.global_shuffling:
-                                dataset = self.dataset.shuffle(seed=self.seed + self.epoch)
-                            iterator = iter(dataset)
-                            self.iter_step = 0
-                        else:
-                            data_remaining = False
-                            break
-
-                # Tokenize (move data from buffer to token_buffer)
-                # TODO: optimize this (tokenization could be handled in a background thread)
-                tokenized = self.tokenizer(buffer, add_special_tokens=False)["input_ids"]
-
-                buffer = []
-                current_buffer_size = 0
-
-                for sample in tokenized:
-                    self.token_buffer.extend(sample)
-
-                if not self.add_bos_token:
-                    effective_max_length = self.max_length
-                else:
-                    effective_max_length = self.max_length - 1
-                
-                # Stack full samples from token buffer
-                n_full_samples = len(self.token_buffer) // effective_max_length
-                if n_full_samples == 0:
-                    continue
-                full_samples = torch.LongTensor(self.token_buffer[:n_full_samples * effective_max_length])
-                full_samples = full_samples.reshape(n_full_samples, effective_max_length)
-                if self.add_bos_token:
-                    bos_tokens = torch.LongTensor([self.tokenizer.bos_token_id] * n_full_samples).unsqueeze(1)
-                    full_samples = torch.cat([bos_tokens, full_samples], dim=1)
-                if self.local_shuffling:
-                    full_samples = full_samples[local_rng.permutation(range(n_full_samples))]
-                self.full_samples = full_samples
-                self.token_buffer = self.token_buffer[n_full_samples * effective_max_length:]
-                
+            iterator = iter(source)
+            if document:
+                # HF's shuffle buffer is not checkpointed. Recreate its exact order from the epoch seed.
+                deque(islice(iterator, document), maxlen=0)
+        start = saved["start"] if saved else 0
+        finished = False
+        while not finished:
+            if saved:
+                chunk = saved
+                offset = chunk["offset"]
+                saved = None
             else:
-                # yield dummay sample
-                final_sample = None
-                for _ in range(self.total_yield_index):
-                    if final_sample is None:
-                        input_ids = self.full_samples[0]
-                        attention_mask = torch.ones_like(input_ids)
-                        final_sample = {"input_ids": input_ids, "attention_mask": attention_mask}
-                        if self.transforms is not None:
-                            for transform in self.transforms:
-                                final_sample = transform(final_sample)
-                    yield final_sample
-            
-            for i, input_ids in enumerate(self.full_samples):
-                if self.resume:
-                    if i < self.full_samples_idx:
+                texts = []
+                size = 0
+                while size < self.buffer_size:
+                    try:
+                        sample = next(iterator)
+                    except StopIteration:
+                        if not self.continuous or document == 0:
+                            finished = True
+                            break
+                        epoch += 1
+                        document = 0
+                        source = source_for_epoch()
+                        iterator = iter(source)
                         continue
-                    elif i == self.full_samples_idx:
-                        self.resume = False
-                        continue
-                self.full_samples_idx = i
-                self.total_yield_index += 1
-                
-                attention_mask = torch.ones_like(input_ids)
-                final_sample = {"input_ids": input_ids, "attention_mask": attention_mask}
-                if self.transforms is not None:
-                    for transform in self.transforms:
-                        final_sample = transform(final_sample)
-                yield final_sample
+                    document += 1
+                    if "blob_id" in sample:
+                        sample = load_python_edu_text(sample)
+                        if not sample["download_success"]:
+                            continue
+                    text = sample["text"] + (self.tokenizer.bos_token if self.add_bos_token else self.tokenizer.eos_token)
+                    texts.append(text)
+                    size += len(text)
+                if not texts:
+                    return
+                tokens = carry.copy()
+                for ids in self.tokenizer(texts, add_special_tokens=False)["input_ids"]:
+                    tokens.extend(ids)
+                length = self.max_length - int(self.add_bos_token)
+                end = len(tokens) // length * length
+                carry = tokens[end:]
+                if not end:
+                    continue
+                samples = torch.tensor(tokens[:end], dtype=torch.long).reshape(-1, length)
+                if self.add_bos_token:
+                    samples = torch.cat((samples.new_full((len(samples), 1), self.tokenizer.bos_token_id), samples), dim=1)
+                shuffle_state = None
+                if self.local_shuffling:
+                    samples = samples[local_rng.permutation(len(samples))]
+                    algorithm, keys, pos, has_gauss, cached_gaussian = local_rng.get_state()
+                    shuffle_state = (algorithm, keys.tolist(), pos, has_gauss, cached_gaussian)
+                # Shuffled HF streams omit their shuffle buffer from state_dict().
+                source_state = (source.state_dict() if self.track_position and not self.global_shuffling
+                                and hasattr(source, "state_dict") else None)
+                chunk = dict(start=start, samples=samples, carry=carry, epoch=epoch, document=document,
+                             source_state=source_state, shuffle_state=shuffle_state)
+                offset = 0
 
+            if not self.track_position:
+                self._chunks.clear()
+            self._chunks.append(chunk)
+            if self.track_position:
+                self.commit_position(self.consumed)
+            for i in range(offset, len(chunk["samples"])):
+                input_ids = chunk["samples"][i]
+                self.total_yield_index = start + i + 1
+                sample = {"input_ids": input_ids, "attention_mask": torch.ones_like(input_ids)}
+                for transform in self.transforms or ():
+                    sample = transform(sample)
+                yield sample
+            start += len(chunk["samples"])

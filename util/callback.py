@@ -31,6 +31,7 @@ class FixedStoppingCallback(TrainerCallback):
         if state.global_step >= self.stop_steps:
             print(f"Stopping training at stop_steps={self.stop_steps}")
             control.should_training_stop = True
+            control.should_save = True
             
             
 class EvalCallback(TrainerCallback):

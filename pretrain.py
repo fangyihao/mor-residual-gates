@@ -23,6 +23,8 @@ from model.util import load_model_from_config
 from model.sharing_strategy import SHARING_STRATEGY
 from model.recursive_residual import LEARNED_GATE_MODES
 from model.relaxation.util import relax_weight_sharing
+from util.resume import checkpoint_step, complete_checkpoint, has_weights, latest_checkpoint, same_recipe
+from util.resume_callback import ResumeCallback
 from util.config import preprocess_config
 from util.device import select_npu
 from util.tokenizer import load_tokenizer_from_config 
@@ -40,11 +42,43 @@ def main(cfg: DictConfig):
         experiment_config = OmegaConf.to_yaml(cfg, resolve=True)
         set_seed(cfg.get("seed", 42))
     cfg = preprocess_config(cfg)
-    if residual is not None and int(os.environ.get("RANK", 0)) == 0:
+    if residual is not None:
         run_dir = Path(SAVE_DIR, "pretrain", cfg.output_dir)
-        run_dir.mkdir(parents=True, exist_ok=True)
-        (run_dir / "training_config.yaml").write_text(experiment_config)
-    
+        options = dict(routed=cfg.get("mor", {}).get("enable", False),
+                       world_size=int(os.environ.get("WORLD_SIZE", 1)), fp16=cfg.precision == "fp16")
+        checkpoint = None
+        if isinstance(cfg.resume_from_checkpoint, str):
+            checkpoint = Path(cfg.resume_from_checkpoint)
+            if cfg.get("resume_step") is not None:
+                checkpoint = checkpoint / f"checkpoint-{cfg.resume_step}"
+            if not complete_checkpoint(checkpoint, **options):
+                raise ValueError(f"Incomplete or missing training checkpoint {checkpoint}")
+        elif cfg.get("auto_resume", True) or cfg.resume_from_checkpoint:
+            checkpoint = latest_checkpoint(run_dir, **options)
+        elif any(run_dir.glob("checkpoint-*")) or (run_dir / "trainer_state.json").exists():
+            raise ValueError(f"Auto-resume is disabled and {run_dir} already contains training output. Choose a fresh name.")
+        saved_config = run_dir / "training_config.yaml"
+        requested = OmegaConf.create(experiment_config)
+        root_state = (run_dir / "trainer_state.json").exists()
+        if root_state or (checkpoint and checkpoint.parent.resolve() == run_dir.resolve()):
+            if not saved_config.is_file() or not same_recipe(OmegaConf.load(saved_config), requested):
+                raise ValueError(f"Training configuration differs from {saved_config}. Choose a fresh name.")
+            target = min(cfg.num_train_steps, cfg.stop_steps) if cfg.stop_steps is not None else cfg.num_train_steps
+            source = checkpoint or run_dir
+            if (checkpoint or has_weights(run_dir)) and checkpoint_step(source) >= target:
+                print(f"{source} already reached the requested {target} updates.")
+                return
+            if not checkpoint:
+                raise ValueError(f"{run_dir} contains training results but no resumable optimizer checkpoint.")
+        cfg.resume_from_checkpoint = str(checkpoint) if checkpoint else False
+        if checkpoint:
+            print(f"Resuming from {checkpoint}")
+        if int(os.environ.get("RANK", 0)) == 0:
+            run_dir.mkdir(parents=True, exist_ok=True)
+            temporary = saved_config.with_suffix(".tmp")
+            temporary.write_text(experiment_config)
+            temporary.replace(saved_config)
+
     if cfg.wandb and cfg.get("wandb_run_id") is None:
         characters = string.ascii_letters + string.digits
         wandb_run_id = "".join(random.choices(characters, k=8))
@@ -73,8 +107,6 @@ def main(cfg: DictConfig):
 
     print ("Loading dataset...")
     train_dataset = load_dataset_from_config(cfg, tokenizer)
-    # The v5 Trainer replays consumed batches on resume. A dataset snapshot here
-    # includes Accelerate's prefetched next batch and would skip real examples.
 
     print ("Loading models...")
     model = load_model_from_config(cfg)
@@ -91,8 +123,8 @@ def main(cfg: DictConfig):
         
         if cfg.resume_from_checkpoint:
             if cfg.relaxation.get("enable"):
-                latest_checkpoint = get_latest_checkpoint_path(cfg, resume_step=cfg.resume_step if ("resume_step" in cfg and cfg.resume_step is not None) else None)                
-                load_model_weights(model.get_base_model(), latest_checkpoint)
+                base_checkpoint = cfg.resume_from_checkpoint if residual is not None else get_latest_checkpoint_path(cfg, resume_step=cfg.resume_step if ("resume_step" in cfg and cfg.resume_step is not None) else None)
+                load_model_weights(model.get_base_model(), base_checkpoint)
                 
     if "mor" in cfg and cfg.mor.get("enable"):            
         if cfg.mor.type == "expert":
@@ -158,7 +190,7 @@ def main(cfg: DictConfig):
         callbacks.append(EvalCallback(cfg, tokenizer))
     if cfg.relaxation.get("enable") and cfg.relaxation.method in ["lora", "dora", "adaption_prompt"]:
         callbacks.append(PeftSaveCallback(cfg.save_steps, fixed_save_steps=fixed_save_steps))
-    if all(ds in LM_DATASETS for ds in cfg.dataset.split(',')):
+    if residual is None and all(ds in LM_DATASETS for ds in cfg.dataset.split(',')):
         callbacks.append(DatasetSaveCallback(cfg.save_steps, fixed_save_steps=fixed_save_steps))
     if fixed_save_steps is not None:
         callbacks.append(ScalingLawsSaveCallback(fixed_save_steps,))
@@ -169,6 +201,9 @@ def main(cfg: DictConfig):
         trainer_cls = RecursiveTrainer if residual is not None and residual.mode in LEARNED_GATE_MODES else Trainer
         trainer = trainer_cls(model=model, args=train_args, train_dataset=train_dataset, callbacks=callbacks,)
     
+    if residual is not None:
+        trainer.add_callback(ResumeCallback(trainer, cfg.resume_from_checkpoint))
+
     train_result = trainer.train(
         resume_from_checkpoint=cfg.resume_from_checkpoint
     )

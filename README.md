@@ -93,7 +93,27 @@ bash scripts/pretrain.sh accelerate offline 0,1 all -- --seeds 1234,1235 --sampl
 
 Use `--train-only` to stop after training. Shared Hydra overrides such as `recursive.num_recursion=4` or `recursive.residual.lambda_r=0.5` apply to every run. On the GPU launcher, pass suite options and Hydra overrides after `--`. On multiple Ascend hosts, run the same command on each host with its usual rendezvous settings.
 
-The preset gives each mode and seed its own checkpoint directory. A literal `name=pilot` or `output_dir=pilot` becomes a prefix, for example `pilot_rezero_stage_seed1234`. Repeating a suite skips completed runs with matching configurations and final weights, resumes interrupted runs from their checkpoints, and includes all modes in the evaluation. Use a fresh prefix when changing the training recipe.
+The preset gives each mode and seed its own checkpoint directory. A literal `name=pilot` or `output_dir=pilot` becomes a prefix, for example `pilot_rezero_stage_seed1234`. Use the same prefix and seeds on restart.
+
+```bash
+# Resume the suite on eight Ascend NPUs (also the default on a repeat invocation).
+bash scripts/run_npu.sh all 0,1,2,3,4,5,6,7 --auto-resume name=pilot
+
+# Score available pilot runs only, including runs stopped after a checkpoint.
+bash scripts/run_npu.sh all 0,1,2,3,4,5,6,7 --eval-only name=pilot --output-file pilot_eval.json
+
+# GPU suite or an individual experiment
+bash scripts/pretrain.sh accelerate offline 0,1 all -- --auto-resume name=gpu_pilot
+bash scripts/pretrain.sh accelerate offline 0,1 all -- --eval-only name=gpu_pilot
+bash scripts/run_npu.sh train 0,1 auto_resume=true name=one_run
+bash scripts/run_npu.sh eval 0,1 --exp_names one_run --latest-saved --strict --sample_number 200
+```
+
+**Resuming.** Each completed save records the model and gates, optimizer, learning-rate scheduler, active AMP scaler, trainer step and logs, router counters, and each rank’s RNG state. With the default zero-worker FineWeb loader, the checkpoint also records the next **consumed** packed-sample position, the token remainder, the current packed block, the source position, and the local shuffle generator. This accounts for loader prefetch and gradient accumulation. With global shuffling, the loader reconstructs the current source epoch’s shuffle buffer from its seed and document offset. Multi-worker loaders, map-style datasets and compatible older checkpoints use deterministic Trainer replay to reach the saved batch. Keep the input data, tokenizer, training recipe, effective batch and device topology the same across restarts.
+
+Restarting continues from the latest complete optimizer-step checkpoint and repeats work done after it. Set `save_interval=null save_steps=100`, for example, to bound this work to 100 updates. A planned `stop_steps` also saves at its stopping step. You can raise or remove `stop_steps` while keeping the original `num_train_steps` and scheduler. The suite skips finished runs. Use `--no-auto-resume` (single run: `auto_resume=false`) to require a fresh directory for unfinished training.
+
+**Evaluation only.** `--eval-only` scores the newest available saved weights per matching run on the same FineWeb sample prefix. It lists absent runs, reports the evaluated step, and prints paired ReZero differences only for matching steps and seeds. The JSON maps run names to losses. For one run, use the individual evaluation command above.
 
 Held-out losses are saved in `residual_suite_fineweb.json` in the repository root. Set `--output-file FILE` to choose a different path. The report prints NLL for each run, total input tokens and executed token-layers when tracking is enabled, and a paired loss difference for each seed. Negative layer-specific minus stage-shared NLL favors `rezero`. Token-layer counts include compacted-batch padding and exclude backward recomputation. Compare matched totals and use separate validation data when choosing fixed schedule coefficients.
 
@@ -211,7 +231,7 @@ To get started, follow these steps to set up your development environment. We re
     ```
 
 2.  **Install Required Packages:**
-    Install the PyTorch build for your hardware, then install this branch's requirements. The recursive residual implementation targets **Transformers 5.23.0**. Training writes safetensors checkpoints and the evaluation scripts also read previous PyTorch weight files. On resume, Trainer replays the consumed batches in the current epoch to restore the packed sequence order. This replay takes longer for checkpoints deep into a large epoch.
+    Install the PyTorch build for your hardware, then install this branch's requirements. The recursive residual implementation targets **Transformers 5.23.0**. Training writes safetensors checkpoints and the evaluation scripts also read previous PyTorch weight files. The recursive residual preset enables automatic checkpoint resume. See the suite instructions above for packed-stream and multi-worker behavior.
 
     ```bash
     python -m pip install -r requirements.txt

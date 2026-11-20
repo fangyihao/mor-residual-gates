@@ -62,7 +62,7 @@ def load_dataset_from_config(cfg, tokenizer):
         if len(train_dataset) == 1:
             train_dataset = train_dataset[0]
         else:
-            train_dataset = interleave_datasets(train_dataset, probabilities=cfg.weights.split(','), seed=42)
+            train_dataset = interleave_datasets(train_dataset, probabilities=[float(weight) for weight in cfg.weights.split(",")], seed=42)
         
     elif all(ds in TOKENIZED_DATASETS for ds in dataset_name):
         dataset_type = "token"

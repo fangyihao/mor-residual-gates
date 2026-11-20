@@ -36,6 +36,7 @@ def test_custom_directories_match_hydra():
 def launch(tmp_path):
     repo = tmp_path / "repo"
     shutil.copytree(ROOT / "scripts", repo / "scripts")
+    (repo / "util").symlink_to(ROOT / "util", target_is_directory=True)
     (repo / "conf").symlink_to(ROOT / "conf", target_is_directory=True)
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -61,7 +62,8 @@ if "evaluate_fineweb_test.py" in args:
     path.write_text(json.dumps(dict.fromkeys(names, 3.0)))
     for name in names:
         run = Path("results/pretrain") / name
-        run.mkdir(parents=True)
+        run.mkdir(parents=True, exist_ok=True)
+        (run / "model.safetensors").write_bytes(b"weights")
         (run / "trainer_state.json").write_text('{"log_history":[{"loss":3,"input_tokens":20,"executed_token_layers":40}]}')
 ''')
     stub.chmod(0o755)
@@ -76,7 +78,8 @@ if "evaluate_fineweb_test.py" in args:
         env = dict(os.environ, PATH=f"{bin_dir}:{os.environ['PATH']}", CALLS=str(calls), NNODES="1",
                    NODE_RANK="0", CONFIG_NAME="recursive_residual", **extra_env)
         result = subprocess.run(["bash", *args, *options], cwd=repo, env=env, text=True, capture_output=True, timeout=40)
-        return result, [json.loads(line) for line in calls.read_text().splitlines()]
+        return result, [json.loads(line) for line in calls.read_text().splitlines()] if calls.exists() else []
+    invoke.repo = repo
     return invoke
 
 
@@ -126,10 +129,32 @@ def test_completed_and_interrupted_runs(tmp_path, monkeypatch):
     state = directory / "trainer_state.json"
     state.write_text(json.dumps({"global_step": 3}))
     assert not suite.completed(run)
-    (directory / "model.safetensors").touch()
+    (directory / "model.safetensors").write_bytes(b"weights")
     assert suite.completed(run)
     state.write_text(json.dumps({"global_step": 2}))
     assert not suite.completed(run)
     run.config.recursive.residual.lambda_r = 0.5
     with pytest.raises(ValueError, match="fresh name="):
         suite.completed(run)
+
+def test_eval_only_from_interrupted_suite(launch):
+    run = launch.repo / "results/pretrain/pilot_full_seed19"
+    checkpoint = run / "checkpoint-6"
+    checkpoint.mkdir(parents=True)
+    state = checkpoint / "trainer_state.json"
+    state.write_text('{"global_step":6,"log_history":[]}')
+    weights = checkpoint / "model.safetensors"
+    weights.write_bytes(b"weights")
+    sizes = {p.name: p.stat().st_size for p in checkpoint.iterdir()}
+    (checkpoint / "resume.json").write_text(json.dumps(dict(version=1, global_step=6, files=sizes)))
+    result, calls = launch("npu", ["--eval-only", "name=pilot", "seed=19"])
+    assert result.returncode == 0, result.stderr
+    assert len(calls) == 1 and str(checkpoint) in calls[0][1]
+    assert "pretrain.py" not in calls[0][1]
+    assert "step=6" in result.stdout and "Skipping pilot_rezero" in result.stdout
+
+
+def test_eval_only_missing_and_exclusive(launch):
+    for options in (["--eval-only", "seed=2"], ["--eval-only", "--train-only"]):
+        result, calls = launch("npu", options)
+        assert result.returncode != 0 and not calls

@@ -9,6 +9,7 @@ output_dir: null
 wandb_run_id: null
 tensorboard: false
 tensorboard_dir: null
+auto_resume: true
 resume_from_checkpoint: false
 resume_step: null
 dataset: fineweb_edu
