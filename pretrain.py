@@ -21,6 +21,7 @@ from accelerate import Accelerator
 from lm_dataset.load_dataset import LM_DATASETS, load_dataset_from_config 
 from model.util import load_model_from_config
 from model.sharing_strategy import SHARING_STRATEGY
+from model.recursive_residual import LEARNED_GATE_MODES
 from model.relaxation.util import relax_weight_sharing
 from util.config import preprocess_config
 from util.device import select_npu
@@ -165,7 +166,7 @@ def main(cfg: DictConfig):
     if "mor" in cfg and cfg.mor.get("enable"):
         trainer = MoRTrainer(model=model, args=train_args, train_dataset=train_dataset, callbacks=callbacks, cfg=cfg,)
     else:
-        trainer_cls = RecursiveTrainer if residual is not None and residual.mode == "rezero" else Trainer
+        trainer_cls = RecursiveTrainer if residual is not None and residual.mode in LEARNED_GATE_MODES else Trainer
         trainer = trainer_cls(model=model, args=train_args, train_dataset=train_dataset, callbacks=callbacks,)
     
     train_result = trainer.train(

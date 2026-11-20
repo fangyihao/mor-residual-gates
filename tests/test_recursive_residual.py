@@ -74,15 +74,21 @@ def test_invalid_schedule(args):
 
 
 @pytest.mark.parametrize("sharing", ["cycle", "sequence", "middle_cycle", "middle_sequence"])
-def test_dense_layout_and_checkpoints(sharing, tmp_path):
-    model, _ = tiny_model(router=None, sharing=sharing)
+@pytest.mark.parametrize("mode", ["rezero", "rezero_stage"])
+def test_dense_layout_and_checkpoints(mode, sharing, tmp_path):
+    model, _ = tiny_model(mode, router=None, sharing=sharing)
     offset = int(sharing.startswith("middle"))
+    gates_by_stage = [[], [], []]
     for physical in range(2):
         for stage in range(3):
             pos = stage * 2 + physical if sharing.endswith("cycle") else physical * 3 + stage
             layer = model.model.layers[offset + pos]
-            assert hasattr(layer, "recursive_gate") == (stage > 0)
-    assert len(gates(model)) == 4
+            layer_gates = gates(layer) if mode == "rezero_stage" else list(layer.parameters(recurse=False))
+            assert len(layer_gates) == int(stage > 0)
+            gates_by_stage[stage].extend(layer_gates)
+    assert len(gates(model)) == (2 if mode == "rezero_stage" else 4)
+    for a, b in gates_by_stage[1:]:
+        assert (a is b) == (mode == "rezero_stage")
     for i, gate in enumerate(gates(model)):
         gate.data.fill_(i - 1.5)
     ids = torch.arange(12).view(2, 6)
@@ -90,10 +96,13 @@ def test_dense_layout_and_checkpoints(sharing, tmp_path):
     model.save_pretrained(tmp_path)
     loaded = LlamaForCausalLM.from_pretrained(tmp_path, attn_implementation="eager")
     torch.testing.assert_close(loaded(ids).logits, model(ids).logits, rtol=0, atol=0)
+    if mode == "rezero_stage":
+        assert len(gates(loaded.to("meta"))) == 2
 
 
-def test_k_one_has_no_gate():
-    model, _ = tiny_model(router=None, sharing="cycle", k=1)
+@pytest.mark.parametrize("mode", ["rezero", "rezero_stage"])
+def test_k_one_has_no_gate(mode):
+    model, _ = tiny_model(mode, router=None, sharing="cycle", k=1)
     assert not gates(model)
 
 
@@ -172,7 +181,7 @@ def test_sparse_routes_match_fixed_ablations(router):
 
 
 @pytest.mark.parametrize("router", ["expert", "token", None])
-@pytest.mark.parametrize("mode", ["rezero", "full", "uniform", "power", None])
+@pytest.mark.parametrize("mode", ["rezero", "rezero_stage", "full", "uniform", "power", None])
 def test_checkpoint_replays_only_decoder_blocks_and_preserves_gradients(router, mode):
     reference, cfg = tiny_model(mode=mode, router=router)
     cfg.mor.z_loss = True
@@ -238,8 +247,9 @@ def test_checkpointing_cache_is_training_only(router):
 @pytest.mark.parametrize("router", ["expert", "token"])
 @pytest.mark.parametrize("checkpointing", [False, True])
 @pytest.mark.parametrize("sharing", ["middle_cycle", "sequence"])
-def test_gate_gradients_groups_and_reload(router, checkpointing, sharing, tmp_path):
-    model, cfg = tiny_model(router=router, sharing=sharing)
+@pytest.mark.parametrize("mode", ["rezero", "rezero_stage"])
+def test_gate_gradients_groups_and_reload(mode, router, checkpointing, sharing, tmp_path):
+    model, cfg = tiny_model(mode, router=router, sharing=sharing)
     if checkpointing:
         model.activation_checkpointing_enable({"use_reentrant": False})
     args = TrainingArguments(output_dir=str(tmp_path), use_cpu=True, weight_decay=0.1, report_to=[])
@@ -247,6 +257,7 @@ def test_gate_gradients_groups_and_reload(router, checkpointing, sharing, tmp_pa
     optimizer = trainer.create_optimizer()
     gate_group, = [group for group in optimizer.param_groups if group.get("name") == "recursive_gates"]
     assert gate_group["weight_decay"] == 0
+    assert len(gate_group["params"]) == (2 if mode == "rezero_stage" else 4)
     assert {id(p) for p in gate_group["params"]} == {id(p) for p in gates(model)}
     assert all(p.ndim == 0 and p.item() == 0.0 for p in gates(model))
     ids = torch.arange(24).view(3, 8)
@@ -257,7 +268,7 @@ def test_gate_gradients_groups_and_reload(router, checkpointing, sharing, tmp_pa
     assert all(p.detach().abs() > 0 for p in gates(model))
     assert all(m.training_step == 1 for m in model.modules() if getattr(m, "mor", False))
     model.save_pretrained(tmp_path)
-    reloaded, _ = tiny_model(router=router, sharing=sharing)
+    reloaded, _ = tiny_model(mode, router=router, sharing=sharing)
     load_model_weights(reloaded, tmp_path)
     native_reload = MoRLlamaForCausalLM.from_pretrained(tmp_path, attn_implementation="eager")
     assert sum(p.numel() for p in native_reload.parameters()) == sum(p.numel() for p in model.parameters())
@@ -266,10 +277,57 @@ def test_gate_gradients_groups_and_reload(router, checkpointing, sharing, tmp_pa
 
 
 @pytest.mark.parametrize("router", ["expert", "token"])
+def test_shared_gate_gradient_sums_physical_layer_gradients(router):
+    shared, _ = tiny_model("rezero_stage", router=router, sharing="sequence")
+    separate, _ = tiny_model("rezero", router=router, sharing="sequence")
+    gradients = {}
+    with torch.no_grad():
+        for gate, value in zip(gates(shared), [-0.5, 1.25], strict=True):
+            gate.fill_(value)
+            gradients[gate] = []
+        separate_params = dict(separate.named_parameters())
+        for name, gate in shared.named_parameters(remove_duplicate=False):
+            if name.endswith(".stage_gate.recursive_gate"):
+                independent = separate_params[name.replace(".stage_gate.recursive_gate", ".recursive_gate")]
+                independent.copy_(gate)
+                gradients[gate].append(independent)
+    ids = torch.arange(24).view(3, 8)
+    outputs = [m(ids, labels=ids, num_items_in_batch=torch.tensor(21)) for m in (shared, separate)]
+    torch.testing.assert_close(outputs[0].logits, outputs[1].logits, atol=0, rtol=0)
+    for output in outputs:
+        (output.loss + output.sampling_loss + output.balancing_loss).backward()
+    for gate, independent in gradients.items():
+        assert len(independent) == 2
+        reference = sum(p.grad for p in independent if p.grad is not None)
+        torch.testing.assert_close(gate.grad, reference)
+
+
+@pytest.mark.parametrize("checkpointing", [False, True])
+def test_executed_token_layers_per_training_interval(tmp_path, checkpointing):
+    model, cfg = tiny_model("rezero_stage", router="expert")
+    cfg.track_token_layers = True
+    ids = torch.arange(6)
+    args = TrainingArguments(
+        output_dir=str(tmp_path), use_cpu=True, per_device_train_batch_size=2, gradient_accumulation_steps=2,
+        max_steps=3, logging_steps=2, save_strategy="no", report_to=[], activation_checkpointing=checkpointing,
+    )
+    trainer = MoRTrainer(model=model, cfg=cfg, args=args, train_dataset=[{"input_ids": ids, "labels": ids}] * 12)
+    trainer.train()
+    rows = [entry for entry in trainer.state.log_history if "loss" in entry]
+    assert len(rows) == 2
+    for row, examples in zip(rows, [8, 4], strict=True):
+        assert row["input_tokens"] == examples * 6
+        # Two middle layers see 6, 4 and 2 tokens each. Both bookends see all 6.
+        assert row["executed_token_layers"] == examples * (2 * (6 + 4 + 2) + 2 * 6)
+
+
+@pytest.mark.parametrize("router", ["expert", "token"])
 @pytest.mark.parametrize("sharing", ["sequence", "middle_sequence", "cycle", "middle_cycle"])
 @pytest.mark.parametrize("share_kv", [False, True])
-def test_preserves_entire_pretrained_model(router, sharing, share_kv, tmp_path):
+@pytest.mark.parametrize("mode", ["rezero", "rezero_stage"])
+def test_preserves_entire_pretrained_model(mode, router, sharing, share_kv, tmp_path):
     cfg = OmegaConf.load(PRESET)
+    cfg.recursive.residual.mode = mode
     cfg.recursive.sharing = sharing
     cfg.mor.type = router
     cfg.mor.capacity = "1,0.6,0.3"
@@ -289,7 +347,7 @@ def test_preserves_entire_pretrained_model(router, sharing, share_kv, tmp_path):
     if share_kv:
         model.set_kv_sharing_config(cfg)
     getattr(model, "transform_layer_to_mor_" + router)(cfg)
-    assert len(gates(model)) == 2 * physical_depth
+    assert len(gates(model)) == (2 if mode == "rezero_stage" else 2 * physical_depth)
     if router == "token":
         set_depth_router(model)
     ids = torch.arange(24).view(3, 8)

@@ -101,6 +101,7 @@ save_total_limit: null
 logging_steps: 100
 dataloader_num_workers: 0
 gradient_checkpointing: false
+track_token_layers: false
 deepspeed: ds_configs/stage2.config
 evaluation:
   enable: false

@@ -1,10 +1,13 @@
 """Recursive optimizer groups and routing objectives for the Transformers Trainer."""
 import json
 from collections import defaultdict
+from contextlib import ExitStack
 from pathlib import Path
 
 import torch
 from transformers import Trainer, TrainerCallback
+
+from model.base_model.modeling_llama import LlamaDecoderLayer
 
 
 class RecursiveTrainer(Trainer):
@@ -45,6 +48,9 @@ class RouterCallback(TrainerCallback):
 
     def on_step_end(self, args, state, control, model, **kwargs):
         trainer = self.trainer
+        if trainer.track_token_layers and (control.should_save or control.should_training_stop):
+            # Keep the final partial interval, including at a resumable checkpoint.
+            control.should_log = True
         if trainer.ratio_count:
             ratios = trainer.accelerator.reduce(trainer.ratio_sum / trainer.ratio_count, reduction="mean")
             ratios = ratios.reshape(-1, trainer.cfg.recursive.num_recursion)
@@ -69,11 +75,28 @@ class MoRTrainer(RecursiveTrainer):
     def __init__(self, *args, cfg, **kwargs):
         super().__init__(*args, **kwargs)
         self.cfg = cfg
+        self.track_token_layers = cfg.get("track_token_layers", False)
         self.metric_sums = defaultdict(float)
         self.metric_counts = defaultdict(int)
         self.ratio_sum = 0
         self.ratio_count = 0
         self.add_callback(RouterCallback(self))
+        self.batch_token_layers = None
+        self.interval_token_layers = 0
+        self.interval_input_tokens = 0
+
+    def train(self, *args, **kwargs):
+        with ExitStack() as hooks:
+            if self.track_token_layers:
+                for block in self.model.modules():
+                    if isinstance(block, LlamaDecoderLayer):
+                        hooks.enter_context(block.register_forward_pre_hook(self._count_decoder_inputs))
+            return super().train(*args, **kwargs)
+
+    def _count_decoder_inputs(self, _module, args):
+        if self.batch_token_layers is not None:
+            batch, length, _ = args[0].shape
+            self.batch_token_layers += batch * length
 
     def _load_optimizer_and_scheduler(self, checkpoint):
         # v4 saved the auxiliary router's AdamW state in a separate file.
@@ -129,7 +152,13 @@ class MoRTrainer(RecursiveTrainer):
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         if num_items_in_batch is None and model.training:
             num_items_in_batch = (inputs["labels"][..., 1:] != -100).sum().clamp_min(1)
+        self.batch_token_layers = 0 if self.track_token_layers and model.training else None
         loss, outputs = super().compute_loss(model, inputs, return_outputs=True, num_items_in_batch=num_items_in_batch)
+        if self.batch_token_layers is not None:
+            self.interval_token_layers += self.batch_token_layers
+            self.interval_input_tokens += inputs["input_ids"].numel()
+            # Checkpoint recomputation happens after compute_loss returns.
+            self.batch_token_layers = None
         if model.training:
             mor = self.cfg.mor
             world = self.accelerator.num_processes if self.args.average_tokens_across_devices else 1
@@ -159,6 +188,12 @@ class MoRTrainer(RecursiveTrainer):
             for name, total in self.metric_sums.items():
                 mean = self.accelerator.reduce(total / self.metric_counts[name], reduction="mean")
                 logs[name] = mean.item()
+            if self.track_token_layers:
+                counts = torch.tensor([self.interval_token_layers, self.interval_input_tokens],
+                                      dtype=torch.long, device=self.accelerator.device)
+                work, tokens = self.accelerator.reduce(counts, reduction="sum").tolist()
+                logs.update(executed_token_layers=work, input_tokens=tokens)
+                self.interval_token_layers = self.interval_input_tokens = 0
             self.metric_sums.clear()
             self.metric_counts.clear()
         super().log(logs, start_time)

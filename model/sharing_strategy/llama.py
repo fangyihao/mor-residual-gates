@@ -241,7 +241,7 @@ def sharing_strategy(cfg, model):
     
     if init_strategy == "pretrained":
         # Expand the virtual execution order while retaining every pretrained
-        # physical block. Each execution needs its own cache index and gate.
+        # physical block. Each execution needs its own cache index.
         k = cfg.recursive.num_recursion
         middle = sharing_strategy.startswith("middle_")
         original = list(model.model.layers)

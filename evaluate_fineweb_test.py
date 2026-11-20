@@ -214,7 +214,7 @@ def evaluate_model(exp_name: str, global_sample_number: int, state=None, attn_im
     count = count.item()
     if count == 0:
         return None
-    avg_loss = round(total_loss.item() / count, 4)
+    avg_loss = total_loss.item() / count
     if state.is_main_process:
         print(f"Experiment: {exp_name}, fineweb_test loss ({count} samples): {avg_loss:.4f}")
     return avg_loss

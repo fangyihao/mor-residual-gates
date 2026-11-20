@@ -129,7 +129,8 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
-        gate = getattr(self, "recursive_gate", None)
+        stage_gate = getattr(self, "stage_gate", None)
+        gate = stage_gate["recursive_gate"] if stage_gate is not None else getattr(self, "recursive_gate", None)
         if gate is not None:
             if isinstance(gate, torch.Tensor):
                 gate = gate.to(block_input.dtype)

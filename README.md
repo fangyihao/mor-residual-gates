@@ -21,15 +21,16 @@ For each selected extra execution $j$, the whole attention-plus-MLP block return
 | Experiment | `recursive.residual.mode` | Extra-execution coefficient |
 | --- | --- | --- |
 | **Proposed ReZero-style gates** | `rezero` | Learned $\alpha_{l,j}$, initialized to zero |
+| Stage-shared ReZero ablation | `rezero_stage` | Learned $\alpha_j$, shared across physical layers and initialized to zero |
 | Full-strength ablation | `full` | $1$ |
 | Uniform ablation | `uniform` | $\Lambda_R/(K-1)$ |
 | Normalized power-law ablation | `power` | $\Lambda_R j^{-\zeta}/\sum_{r=2}^{K} r^{-\zeta}$ |
 
 For example, with $K=3$, $\Lambda_R=1$ and $\zeta=1$, the extra-stage coefficients are $(0.5,0.5)$ for uniform and $(0.6,0.4)$ for power. `lambda_r` sets the sum of update coefficients across the available extra stages. The actual perturbation also depends on the block outputs and which stages a token reaches. Router capacity controls how many tokens execute a stage.
 
-The experiment preset uses `recursive.initialization=pretrained` to retain every source layer and tie its weights across executions. With $L$ source layers and sequence sharing, this gives $L(K-1)$ learned scalars. Zero gates reproduce the source model's one-pass representation at initialization. All four modes write the selected block's returned state back to the token. The original MoR presets use their published router-weighted scatter-add convention. In the four residual modes hard selection trains the router through its auxiliary objective. The preset uses expert choice with `aux_loss`. Token choice is available with `mor.type=token` and its balancing loss.
+The experiment preset uses `recursive.initialization=pretrained` to retain every source layer and tie its weights across executions. With $L$ source layers and sequence sharing, `rezero` learns $L(K-1)$ independent scalars. The `rezero_stage` ablation ties together all scalars at the same extra stage, giving $K-1$ trainable scalars in total. Gradients from every selected layer accumulate into the same stage parameter. Both modes use the same gate initialization, learning rate and zero weight decay. Zero gates reproduce the source model's one-pass representation at initialization. All five modes write the selected block's returned state back to the token. The original MoR presets use their published router-weighted scatter-add convention. In these residual modes hard selection trains the router through its auxiliary objective. The preset uses expert choice with `aux_loss`. Token choice is available with `mor.type=token` and its balancing loss.
 
-### Running the four experiments
+### Running the recursive residual experiments
 
 Prepare FineWeb-Edu and the environment as described below. The fork reads the model and tokenizers from its local Hugging Face cache. To populate that cache on a fresh checkout, run from the repository root.
 
@@ -44,10 +45,10 @@ for model in ("HuggingFaceTB/SmolLM-135M", "HuggingFaceTB/SmolLM2-135M"):
 PY
 ```
 
-The single-GPU example below uses the same pretrained weights, seed, router, $K=3$, data, and learning rate for all four experiments. To run only the proposal, use `rezero` as the sole mode.
+The single-GPU example below uses the same pretrained weights, seed, router, $K=3$, data, and learning rate for all five experiments. To run only the proposal, use `rezero` as the sole mode.
 
 ```bash
-for mode in rezero full uniform power; do
+for mode in rezero rezero_stage full uniform power; do
     accelerate launch --config_file acc_configs/single_gpu_config.yaml \
         pretrain.py --config-name recursive_residual \
         recursive.residual.mode="$mode" || break
@@ -73,9 +74,53 @@ model = MoRLlamaForCausalLM.from_pretrained(
 Run the CPU regression suite with `python -m pytest -q tests/test_recursive_residual.py`. It uses tiny local Llama checkpoints to test pretrained preservation, sparse routing, signed gates, fixed coefficients, checkpoint restoration, and optimizer grouping.
 
 
+### Paired stage-sharing comparison at $K=8$
+
+The example below runs three paired seeds with the same expert router, token budget and optimizer on eight Ascend NPUs. It compares seven shared stage scalars, seven independent scalars per physical layer, and a fixed schedule. The example uses uniform scaling with $\Lambda_R=1$. Choose the fixed schedule and its coefficients on validation data before scoring the held-out FineWeb set.
+
+```bash
+set -e
+devices=0,1,2,3,4,5,6,7
+fixed_mode=uniform
+fixed_args=(recursive.residual.lambda_r=1.0)
+runs=()
+for seed in 1234 1235 1236; do
+    for mode in "$fixed_mode" rezero_stage rezero; do
+        run="gate_sharing_k8_${mode}_seed${seed}"
+        args=()
+        if [[ "$mode" == "$fixed_mode" ]]; then args=("${fixed_args[@]}"); fi
+        bash scripts/run_npu.sh train "$devices" name="$run" seed="$seed" \
+            recursive.num_recursion=8 recursive.residual.mode="$mode" \
+            gradient_checkpointing=true track_token_layers=true "${args[@]}"
+        runs+=("$run")
+    done
+done
+bash scripts/run_npu.sh eval "$devices" --exp_names "${runs[@]}" \
+    --sample_number 200 --output_file stage_gate_fineweb.json
+
+python - "${runs[@]}" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+losses = json.loads(Path("stage_gate_fineweb.json").read_text())
+names = sys.argv[1:]
+for fixed, shared, proposed in zip(names[::3], names[1::3], names[2::3], strict=True):
+    for name in (fixed, shared, proposed):
+        state = json.loads((Path("results/pretrain") / name / "trainer_state.json").read_text())
+        rows = [row for row in state["log_history"] if "loss" in row]
+        tokens = sum(row["input_tokens"] for row in rows)
+        work = sum(row["executed_token_layers"] for row in rows)
+        print(f"{name}  NLL={losses[name]:.7f}  tokens={tokens}  token-layers={work}")
+    print(f"{proposed}  layer-specific minus stage-shared NLL={losses[proposed] - losses[shared]:+.7f}")
+PY
+```
+
+Compare runs with the same measured input-token and token-layer totals. The training logs sum both counts across all workers. One executed token-layer is one position presented to a decoder block during the training forward pass. This includes compacted-batch padding. The count excludes backward recomputation. Use the same held-out samples for every run and report the per-seed loss difference $\mathrm{NLL}_{\text{rezero}}-\mathrm{NLL}_{\text{rezero\_stage}}$. Negative values favor layer-specific gates.
+
 ### Gradient checkpointing
 
-Append `gradient_checkpointing=true` to a training command to save activation memory by recomputing decoder blocks during backward. The default is `false`. The same option works for ReZero and all three fixed ablations. Each router selects tokens and updates its warmup counter once per forward pass. Checkpointed training uses full input sequences with the KV cache disabled.
+Append `gradient_checkpointing=true` to a training command to save activation memory by recomputing decoder blocks during backward. The default is `false`. The same option works for both learned gate modes and the three fixed ablations. Each router selects tokens and updates its warmup counter once per forward pass. Checkpointed training uses full input sequences with the KV cache disabled.
 
 ```bash
 # Two GPUs
@@ -96,7 +141,7 @@ bash scripts/run_npu.sh train 0,1,2,3,4,5,6,7 name=ascend_rezero
 bash scripts/run_npu.sh eval 0,1,2,3,4,5,6,7 --exp_names ascend_rezero --sample_number 200
 ```
 
-The device list selects visible Ascend device IDs on the current host. List them in ascending order. The launcher binds one worker to each selected device. The `check` command verifies an HCCL all-reduce across every rank before you load a model. Training uses replicated data parallelism, ordinary PyTorch AdamW, and SDPA by default. Pass `attn_implementation=eager` to training or `--attn_implementation eager` to evaluation to select eager attention. All four residual modes use this launcher. For example, append `recursive.residual.mode=power name=ascend_power` to the training command.
+The device list selects visible Ascend device IDs on the current host. List them in ascending order. The launcher binds one worker to each selected device. The `check` command verifies an HCCL all-reduce across every rank before you load a model. Training uses replicated data parallelism, ordinary PyTorch AdamW, and SDPA by default. Pass `attn_implementation=eager` to training or `--attn_implementation eager` to evaluation to select eager attention. All five residual modes use this launcher. For example, append `recursive.residual.mode=power name=ascend_power` to the training command.
 
 The default global batch of 1,024 sequences on eight NPUs uses 16 sequences per NPU and eight accumulation steps. The launcher uses the total number of workers across hosts when deriving accumulation. Expert-router BCE is averaged across workers and accumulated microbatches, so its coefficient has the same scale when splitting a batch. FineWeb evaluation distributes the requested packed samples across workers, aggregates their losses, and writes one results file from rank zero.
 
