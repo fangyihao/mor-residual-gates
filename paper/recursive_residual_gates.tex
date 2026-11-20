@@ -1,0 +1,336 @@
+% Self-contained manuscript. Build with: latexmk -pdf recursive_residual_gates.tex
+% Author names and affiliations may be supplied below. All empirical cells start blank.
+\documentclass[11pt,letterpaper]{article}
+\usepackage[margin=0.92in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern,microtype}
+\usepackage{amsmath,amssymb,booktabs,array,graphicx,xcolor}
+\usepackage[numbers,sort&compress]{natbib}
+\usepackage[hidelinks]{hyperref}
+\usepackage{caption}
+\captionsetup{font=small,labelfont=bf,justification=raggedright,singlelinecheck=false}
+\definecolor{muted}{HTML}{596470}
+\newcommand{\pending}{\textcolor{muted}{\textemdash}}
+\newcommand{\paperauthors}{} % Add approved names and affiliations here.
+\newcommand{\nll}{\mathrm{NLL}}
+\newcommand{\rms}{\operatorname{RMS}}
+\newcommand{\code}[1]{\texttt{\detokenize{#1}}}
+\newcommand{\eightpending}{\pending&\pending&\pending&\pending&\pending&\pending&\pending&\pending}
+\newcommand{\shortpending}{\pending&\pending&\pending&\pending&\pending&\pending}
+\newcommand{\figurepanel}[2]{%
+  \IfFileExists{#1}{\includegraphics[width=\linewidth,height=1.28in,keepaspectratio]{#1}}%
+  {\fbox{\parbox[c][1.15in][c]{0.94\linewidth}{\centering\small\color{muted}#2}}}}
+\hypersetup{pdftitle={Learning the Strength of Recursive Updates in Mixture-of-Recursions}}
+\setlength{\emergencystretch}{1.4em}
+\raggedbottom
+\title{\bfseries Learning the Strength of Recursive Updates\\in Mixture-of-Recursions}
+\author{\paperauthors}
+\date{}
+\begin{document}
+\maketitle
+\begin{abstract}
+A recursive language model can choose which tokens revisit a shared Transformer block. A second decision concerns how far a selected token should move when that block runs again. We study a ReZero-style scalar on the difference between a repeated block's output and its input. The first application always executes at full strength. All subsequent gates start at zero, so a token can enter a deeper stage without changing its state at initialization. Our proposed model learns a separate scalar for each physical block and extra stage. A stage-shared variant learns one scalar per extra stage. We specify a paired comparison at a maximum of three executions and a shorter study at three, four and six executions against native Mixture-of-Recursions and two fixed schedules. The design measures language-model quality alongside the raw and applied residuals, so that the effect of learning a step size can be examined at the point where it changes the representation.
+\end{abstract}
+
+\section{Introduction}
+Weight sharing gives a language model a way to spend more computation on a token without storing an entirely new stack of parameters. Mixture-of-Recursions (MoR) adds a router that selects which tokens continue at each pass through a shared stack \citep{bae2025mor}. Consider two tokens that both reach the third pass. They receive the same number of block applications, yet a block can propose a large change to one representation and a small change to the other. Execution depth alone says little about the magnitude of either change.
+
+This distinction matters when a block is reused. A transformation trained for one application may move a representation away from the input distribution expected by the next block when applied again. Even when a recursive model is trained from scratch, each shared block must serve several stages at once. A damped update might make that sharing easier to optimize. Conversely, strong damping might delay learning useful refinements. A final score alone would leave these explanations difficult to distinguish.
+
+We apply the zero-initialized residual gate of \citet{rezero} to the change proposed by an \emph{extra application of a complete decoder block}. The block's existing attention and feed-forward residual paths remain inside that operation. Our main question is whether each physical block needs its own step size at each extra stage. At the main depth of three executions, this amounts to learning twenty scalars, compared with two for the stage-shared control. Both variants have the same initial function, router design, and number of selected tokens.
+
+We make three comparisons. First, we compare those two parameterizations under the full training recipe associated with Table~3 of \citet{bae2025mor}. Second, we test whether fixed step sizes account for any early-training difference at the same depth and token budget. Third, we relate the learned coefficients to the change each block actually makes. The last comparison matters because a large coefficient multiplying a small raw residual can produce a smaller update than a small coefficient multiplying a large residual.
+
+\section{Related work}
+\paragraph{Depth recurrence and token selection.}
+Universal Transformers reuse a transformation over successive depth steps and allow computation to vary by position \citep{universal}. Relaxed Recursive Transformers share a block across loops and allow loop-specific low-rank adaptations \citep{relaxed}. Mixture-of-Depths assigns a limited number of token positions to a layer \citep{mod}. MoR combines token selection with recursive parameter sharing and studies how to cache keys and values for the tokens still active \citep{bae2025mor}. We adopt its expert-choice router, Middle-Cycle sharing layout, and recursion-wise caching recipe. The proposed scalars use the block and stage indices. All selected tokens at that block and stage share the same coefficient.
+
+\paragraph{Residual scaling and loop-dependent updates.}
+ReZero initializes the scalar on a residual transformation to zero \citep{rezero}. LayerScale learns channel-wise residual scales in deep vision Transformers \citep{layerscale}. LoopFormer conditions a loop on its current time and step size and trains across different trajectories \citep{loopformer}. ARLoop uses attention over earlier representations to control which information re-enters a loop \citep{arloop}. These studies motivate a narrower question in routed language models. Once a router has selected the next set of tokens, how much flexibility is gained by giving each reused block its own scalar for that pass? The contribution here is this parameterization and its controlled comparison in MoR. The underlying principle of zero-initialized residual scaling comes from ReZero.
+
+\section{Methodology}
+\subsection{Execution order and notation}
+Let \(F_\ell\) be physical decoder block \(\ell\) in a shared body of \(B\) blocks. A \emph{physical} block has one set of Transformer weights. A \emph{stage} \(j\in\{1,\ldots,K\}\) is one visit to that body. Middle-Cycle applies \(F_1,\ldots,F_B\) in order at each stage, with a separate input block and output block outside the loop. Thus \(K\) counts the first visit as well as the extra visits.
+
+For a sequence of \(T\) positions, let \(A_j\) be the active positions at stage \(j\). The paper recipe uses \(A_1=\{1,\ldots,T\}\). For each later stage, the expert scores tokens still active and retains the highest-scoring positions, with
+\begin{equation}
+  A_j\subseteq A_{j-1},\qquad
+  |A_j|=\max\!\left(1,\left\lfloor T\,\frac{K-j+1}{K}\right\rfloor\right).
+  \label{eq:capacity}
+\end{equation}
+Selected positions return to their original order for causal self-attention. \(X_{\ell,j}\) denotes the matrix of active hidden states entering \(F_\ell\) at this point in the execution order. In particular, the input to block \(\ell>1\) comes from block \(\ell-1\) in the \emph{current} stage. This distinction is important when mapping a single-block recurrence to a multi-block cycle.
+
+\subsection{Recursive hidden-state stabilization}
+\label{sec:stabilization}
+The first application is \(Y_{\ell,1}=F_\ell(X_{\ell,1})\). At an extra stage define
+\begin{align}
+  \widetilde Y_{\ell,j}&=F_\ell(X_{\ell,j}),&
+  \Delta_{\ell,j}&=\widetilde Y_{\ell,j}-X_{\ell,j}. \label{eq:recursive_delta}
+\end{align}
+Every residual-scaling variant uses the update
+\begin{equation}
+  \boxed{Y_{\ell,j}=X_{\ell,j}+\epsilon_{\ell,j}\Delta_{\ell,j},
+       \qquad j=2,\ldots,K.}
+  \label{eq:general_recursive_scaling}
+\end{equation}
+After the last block of a stage, its output replaces the states at \(A_j\). Positions outside \(A_j\) retain their incoming states. For successive executions of a single physical block, writing \(X_{\ell,j}=H_\ell^{(j-1)}\) and \(Y_{\ell,j}=H_\ell^{(j)}\) recovers the single-block recurrence directly. Appendix~\ref{app:proof} establishes its initialization and gradient properties.
+
+\subsection{Learnable ReZero-style recursive residual gates}
+\label{sec:rezero_recursion}
+Our proposed \emph{layer-specific ReZero} sets \(\epsilon_{\ell,j}=\alpha_{\ell,j}\) for \(j\ge2\). Each \(\alpha_{\ell,j}\) is an independent, unconstrained real scalar initialized to zero. At initialization every extra block therefore acts as the identity on its input, even when the router selects that block's tokens. After training, a positive value below one damps the raw residual, a value above one extends the update along the same direction, and a negative value reverses it. The router still executes the selected blocks, including at zero gate, to compute the residual and its gate gradient.
+
+The \emph{stage-shared ReZero} control sets \(\epsilon_{\ell,j}=\beta_j\) for every \(\ell\), also with \(\beta_j=0\) initially. Each shared scalar receives gradient contributions from all \(B\) blocks at its stage. Layer-specific and stage-shared models add \(B(K-1)\) and \(K-1\) trainable scalars, respectively. The scalars use the backbone learning-rate schedule in a dedicated AdamW group with zero weight decay.
+
+\subsection{Fixed schedules and native MoR}
+\label{sec:controls}
+Uniform scaling allocates \(\Lambda_R/(K-1)\) to each extra stage. Normalized power-law scaling allocates the same total in proportion to \(j^{-\zeta}\). We use \(\Lambda_R=1\) and \(\zeta=1\). Both controls use the first pass and selected-position replacement defined above. Appendix~\ref{app:fixed_recursive_scaling} gives the full definitions, including the full-strength limiting case.
+
+Native MoR uses a different stage output. Let \(x_t\) be a selected token's state entering a stage, \(u_t\) the corresponding output of the entire shared body, and \(s_t\) its router logit. The released expert recipe writes \(x_t+0.1\,\sigma(s_t)u_t\) at that position. This rule also applies at stage one. In our variants the stage writes the output of the body after its block-level updates. This changes both the value that reaches the next stage and the continuous path from the language-model loss to a selected router score. A comparison with native MoR measures the combined effect. The layer-specific versus stage-shared comparison holds the writeback and the hard selection rule fixed.
+
+\section{Evaluation}
+\label{sec:evaluation}
+\subsection{Training design}
+The two main models train \emph{from scratch} on the deduplicated FineWeb-Edu subset of the SmolLM corpus \citep{fineweb,smolcorpus}. They use the SmolLM-360M backbone configuration \citep{smolconfig} and the released expert-choice, recursion-wise cache, Middle-Cycle recipe for the fixed-FLOPs \(K=3\) row of MoR Table~3 \citep{bae2025mor}. Pretrained preservation is an initialization property for a compatible pretrained body. The main experiment measures optimization and final quality under the from-scratch recipe.
+
+\begin{table}[htbp]
+\centering
+\caption{Planned model geometry and budgets. Virtual layers count both unshared end blocks. Gate counts are exact architectural quantities. The full-budget panel uses \(K=3\).}
+\label{tab:geometry}
+\small
+\begin{tabular}{@{}lrrrrr@{}}
+\toprule
+Maximum stages \(K\) & Virtual layers & Body blocks \(B\) & Layer-specific gates & Shared gates & Short steps\\
+\midrule
+3 & 32 & 10 & 20 & 2 & 512\\
+4 & 34 &  8 & 24 & 3 & 512\\
+6 & 32 &  5 & 25 & 5 & 512\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The full training target is 14,161 optimizer updates. Each update consumes 1,024 packed sequences of 2,048 tokens, for 29,697,769,472 planned input tokens per full trajectory. We pair seeds 1234, 1235 and 1236 across methods. The default short endpoint is step 512, or 1,073,741,824 input tokens. An explicitly designated reduced-budget study may instead use step 256 (536,870,912 tokens) for \emph{every} short-panel cell. A panel uses one endpoint throughout. Early stops retain the learning-rate schedule of the parent trajectory. The main runs supply the two short \(K=3\) ReZero checkpoints. The other thirteen short trajectories per seed stop at the selected endpoint.
+
+The \(K=4\) setting uses the released 34-layer geometry. The \(K=6\) setting extends the \(K=3\) recipe locally: its 30 interior virtual layers form five physical blocks reused six times. Within a depth we match dataset order for a given seed, initialization recipe, capacity, schedule, token count and evaluation inputs. Across depths, parameter counts and token-layer workloads change. We therefore estimate method differences within each depth before examining how those differences vary with \(K\).
+
+\subsection{Endpoints and paired estimates}
+The primary endpoint is held-out FineWeb negative log-likelihood (NLL, nats). The local scorer averages next-token losses over the same ordered prefix of 500 packed sequences from the released FineWeb test set \citep{finewebtest}. It records the token-ID fingerprint. The full-budget downstream panel reports LAMBADA, HellaSwag, PIQA, WinoGrande, ARC and MMLU continuation. ARC averages its Easy and Challenge splits. The overall score is the unweighted mean of the six task-family percentages. Appendix~\ref{app:evaluation} details the scoring protocol and work accounting.
+
+For the main comparison, let \(d_s=\nll_{\mathrm{layer},s}-\nll_{\mathrm{shared},s}\) at matched seed \(s\), step and token count. We report the individual \(d_s\), their mean, and their sample standard deviation. A negative difference favors layer-specific gating. For downstream accuracy we use percentage-point differences in the same subtraction order. A positive value favors layer-specific gating. The historical MoR row is an external reference. The short panel has a local native run for each seed and depth, allowing a paired contrast to native MoR at that endpoint.
+
+\subsection{Full-budget comparison}
+Table~\ref{tab:main} reserves the columns used by the original MoR main table. The question is whether allowing blocks within a stage to learn different strengths improves held-out NLL, and whether any change is also visible on downstream tasks. The published row is attributed separately because its evaluation prefix and task shot counts cannot both be verified as identical to the local protocol. The short native reruns cannot supply a full-budget local reference.
+
+\begin{table}[htbp]
+\centering
+\caption{Full-budget \(K=3\) comparison in the column order of MoR Table~3. Dashes reserve all empirical cells, including the published reference awaiting transcription. Local rows will show seed means. Params are non-embedding parameters, work is in \(10^{18}\) FLOPs, and tokens are in billions. Local work uses the forward-only convention in Appendix~\ref{app:evaluation}.}
+\label{tab:main}
+\setlength{\tabcolsep}{2.8pt}
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{@{}lcccrrrr|r|rrrrrrr@{}}
+\toprule
+ &\multicolumn{2}{c}{MoR}&\multicolumn{2}{c}{Recursion}&\multicolumn{3}{c}{Pretraining}
+ &\multicolumn{1}{c}{NLL \(\downarrow\)}&\multicolumn{7}{c}{Downstream accuracy (\%) \(\uparrow\)}\\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}\cmidrule(lr){6-8}\cmidrule(lr){10-16}
+Method & Type & KV & Share & \(K\) & Params & Work & Tokens & FineWeb & LD & HS & PQ & WG & ARC & MMLU & Avg\\
+\midrule
+MoR \citep{bae2025mor} & Expert & Cache & M-Cyc & 3 & \pending & \pending & \pending & \eightpending\\
+\midrule
+% Replace the next two rows with the verified *.table3-rows.tex fragment when available.
+Layer-specific ReZero & Expert & Cache & M-Cyc & 3 & \pending & \pending & \pending & \eightpending\\
+Stage-shared ReZero  & Expert & Cache & M-Cyc & 3 & \pending & \pending & \pending & \eightpending\\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+\subsection{Short ablations and representation changes}
+Table~\ref{tab:short} distinguishes two explanations for an early NLL difference. If the fixed schedules match a learned variant, a prescribed reduction in update magnitude may suffice at this endpoint. If the layer-specific variant differs from the stage-shared one, the paired contrast tests the value of independent block coefficients under the same writeback. Figure~\ref{fig:diagnostics} reserves the measurements needed to interpret either outcome. A small gate accompanied by a large proposed residual has a different interpretation from an intrinsically small raw residual.
+
+\begin{table}[htbp]
+\centering
+\caption{Early-training FineWeb results at the common short endpoint. For each depth, report NLL and the within-seed difference \(D=\nll_{\rm method}-\nll_{\rm native}\). Each dash reserves a mean (sample SD) across seeds. The native row defines the reference for \(D\).}
+\label{tab:short}
+\small\setlength{\tabcolsep}{5.5pt}
+\begin{tabular}{@{}lrrrrrr@{}}
+\toprule
+&\multicolumn{2}{c}{\(K=3\)}&\multicolumn{2}{c}{\(K=4\)}&\multicolumn{2}{c}{\(K=6\)}\\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}\cmidrule(lr){6-7}
+Method & NLL & \(D\) & NLL & \(D\) & NLL & \(D\)\\
+\midrule
+Native MoR & \pending & ref. & \pending & ref. & \pending & ref.\\
+Uniform scaling & \shortpending\\
+Power-law scaling & \shortpending\\
+Stage-shared ReZero & \shortpending\\
+Layer-specific ReZero & \shortpending\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[htbp]
+\centering
+\begin{minipage}[t]{0.48\linewidth}\centering
+\figurepanel{gate-heatmap.pdf}{Panel A\\[3pt]Signed gate by physical block\\and extra stage}
+\end{minipage}\hfill
+\begin{minipage}[t]{0.48\linewidth}\centering
+\figurepanel{update-curves.pdf}{Panel B\\[3pt]Raw and applied update RMS\\against training tokens}
+\end{minipage}
+\caption{Reserved diagnostics. Panel A will use a zero-centered scale shared across comparable heatmaps. Panel B will show the raw and applied block residuals at matched tokens. Actual stage-level writeback RMS is the comparable quantity for native MoR. Neither panel currently contains observations.}
+\label{fig:diagnostics}
+\end{figure}
+
+Capacity fixes the number of tokens reaching each stage for a given sequence length. Exit fractions therefore check that methods received the intended workload. They cannot establish that the router selected more useful tokens. We use the signed coefficients, raw residual RMS, applied residual RMS, and actual writeback RMS to distinguish changes in routing workload from changes in state-update strength.
+
+\section{Discussion and limitations}
+The full-budget design identifies the effect of untying scalar strengths across physical blocks within this architecture. Comparisons to native MoR also change the writeback and the router gradient path. The fixed full-strength version of our writeback is specified in Appendix~\ref{app:fixed_recursive_scaling}. The planned experiment matrix omits it. A claim that zero initialization alone explains a difference from native MoR would require additional controls, including a comparison under identical writeback.
+
+A small applied update could preserve a useful state or leave a useful refinement unused. The gate's sign and magnitude therefore need to be interpreted alongside held-out loss. Within a fixed route, the logged RMS is a local measure of displacement. Establishing drift from a pretrained representation distribution would additionally require a pretrained reference and a distributional comparison. The from-scratch main runs address neither pretraining retention nor the behavior of an unrolled dense model with independently trained layers.
+
+The early endpoint probes optimization after warmup. Ranking methods at that point cannot establish their final ordering at \(K=4\) or \(K=6\). Three paired seeds expose variation but provide limited precision for small effects. Finally, the scorer applies expert top-\(k\) selection over a packed sequence. Stage membership at a position can depend on later router scores even though attention is causally masked. The reported protocol measures sequence-scored NLL and downstream accuracy. Strictly online generation quality and serving latency require separate measurements.
+
+\section{Conclusion}
+Recursive depth and recursive update strength are distinct design choices. A zero-initialized scalar on the complete repeated-block residual gives each extra application an identity starting point while preserving the first application. The comparison between block-specific and stage-shared scalars tests the resolution at which those strengths need to be learned. The primary full-budget estimates (layer-specific minus stage-shared) are \pending{} nats on FineWeb and \pending{} percentage points on mean downstream accuracy. The short native-MoR contrasts and measured residuals provide the context for interpreting those differences.
+
+
+\appendix
+\section{Initialization and gradients}
+\label{app:proof}\label{app:rezero_recursion}
+At stage one all tokens traverse the shared body at full strength. At stage \(j\ge2\), substitution of \(\alpha_{\ell,j}=0\) into Eq.~\eqref{eq:general_recursive_scaling} gives \(Y_{\ell,j}=X_{\ell,j}\) for every selected block. Composition over \(B\) blocks leaves the selected rows unchanged. Replacing those rows in the full sequence also leaves every other row unchanged. Induction over \(j\) gives the same sequence at the end of the recursive body as after one pass, for any allowed nested selections. This statement concerns the forward state at initialization. Executing the extra stages still consumes compute.
+
+If the weights come from a compatible pretrained one-pass body, and that pass has the same inputs, positions, masks and computation, its representation is preserved under this construction. In the paper suite the one-pass reference is the randomly initialized shared body. In particular, the identity argument does not reconstruct an arbitrary pretrained dense stack after its independently learned blocks have been tied.
+
+Holding the hard route fixed in a backward pass and denoting the incoming adjoint by \(G_{\ell,j}=\partial\mathcal L/\partial Y_{\ell,j}\), the local contribution to a layer-specific gate gradient is
+\begin{equation}
+ \frac{\partial\mathcal L}{\partial\alpha_{\ell,j}}
+   = \langle G_{\ell,j},\Delta_{\ell,j}\rangle_F.
+ \label{eq:gate_grad}
+\end{equation}
+The inner product sums over selected tokens and hidden coordinates, with the loss's batch reduction understood. A shared stage scalar accumulates the sum of these contributions over \(\ell\). At zero gate the derivative with respect to the input of this block application is the identity, and the direct contribution through its residual to the block weights is zero. The same physical weights still receive gradients from their ungated first application. Equation~\eqref{eq:gate_grad} also explains why skipping the forward computation of a zero-gated residual during training would change the learning rule.
+
+\section{Fixed recursive-residual scaling}
+\label{app:fixed_recursive_scaling}
+For full-strength residual scaling, \(\epsilon_{\ell,j}=1\) yields \(Y_{\ell,j}=F_\ell(X_{\ell,j})\) on every extra visit. This recovers a full repeated block application in the replacement formulation. The native MoR reference uses the separate router-weighted rule in Section~\ref{sec:controls}.
+
+Let \(\Lambda_R\ge0\) be the aggregate coefficient mass assigned to the \(K-1\) possible extra visits of one physical block. For \(K>1\), uniform and normalized power-law scaling use, respectively,
+\begin{align}
+ \epsilon^{\rm unif}_{\ell,j}
+   &=\frac{\Lambda_R}{K-1}, \label{eq:uniform_residual_scaling}\\
+ \epsilon^{\rm power}_{\ell,j}
+   &=\Lambda_R \frac{j^{-\zeta}}{\sum_{r=2}^{K}r^{-\zeta}},\qquad
+     \zeta\ge0,\quad j=2,\ldots,K. \label{eq:normalized_power_scaling}
+\end{align}
+Both schedules satisfy \(\sum_{j=2}^K\epsilon_{\ell,j}=\Lambda_R\). At \(\zeta=0\) the power-law schedule is uniform. For \(K=3\), \(\Lambda_R=1\), and \(\zeta=1\), the uniform coefficients are \((1/2,1/2)\) and the power-law coefficients are \((3/5,2/5)\). For \(K=1\) the set of extra visits is empty. A token exiting early experiences only a prefix of the schedule.
+
+The sum constrains scalar coefficients. Actual displacement depends on the magnitudes and directions of the successive residuals. Neither the compute ratio \(\rho_C\) nor the active-parameter ratio \(\rho_P\) is determined by \(\Lambda_R\). In this suite the selected positions and executed block lengths determine the workload independently of the chosen residual scale.
+
+\section{Evaluation and reproducibility details}
+\label{app:evaluation}
+\paragraph{Data, optimizer and router.}
+We pack training text with the SmolLM tokenizer. The data source is \code{HuggingFaceTB/smollm-corpus}, configuration \code{fineweb-edu-dedup}. The test prefix comes from \code{kimyuji/fineweb-test}. The paper presets use bfloat16, AdamW with learning rate \(3\times10^{-3}\), \(\beta_1=0.9\), \(\beta_2=0.95\), weight decay \(0.1\) on the decay group, and maximum global gradient norm \(1\). The warmup--stable--decay schedule warms up for 86 updates. The linear decay has 2,832 updates in the \(K=3\) and derived \(K=6\) schedule and 2,843 in the released \(K=4\) schedule. Early stopping leaves the schedule horizon intact.
+
+The expert router uses a linear logit, sigmoid scoring, nested top-\(k\) selection and a binary cross-entropy (BCE) auxiliary objective. At each stage the target is membership in the selected set. BCE is averaged over candidate positions within the stage. The training loss is next-token cross-entropy plus \(0.001\) times the sum of the stage BCE terms. The sigmoid score multiplier \(0.1\) in native writeback is distinct from that loss weight and from the learned residual scalars. Gradient checkpointing recomputes activations during backward. Forward workload counts exclude that recomputation.
+
+\paragraph{Metrics and workload.}
+The downstream harness uses the released task definitions for LAMBADA \citep{lambada}, HellaSwag \citep{hellaswag}, PIQA \citep{piqa}, WinoGrande \citep{winogrande}, ARC \citep{arc}, and MMLU \citep{mmlu} in its continuation formulation. Local defaults resolve to zero shots. The run manifest stores resolved shot counts, task versions and sample counts. HellaSwag, PIQA and the two ARC splits normalize candidate log-likelihood by target byte length. Other columns use the corresponding task accuracy. LD, HS, PQ and WG in Table~\ref{tab:main} abbreviate the first four task names. Each task-family score is expressed as a percentage before averaging.
+
+Let \(S\) be the number of input sequences and \(m_j=|A_j|\). For fixed sequence length and the paper settings, the expected number of executed token-layers is
+\begin{equation}
+ W=S\left(2T+B\sum_{j=1}^K m_j\right).
+\end{equation}
+The two end blocks see every position. The implementation checks the workload model against the observed forward count before emitting local FLOP estimates. It counts two FLOPs per multiply--accumulate in the decoder projections, causal query--key and attention--value products, linear routers, and vocabulary projection. Elementwise operations, backward computation, and checkpoint recomputation are excluded. The report records observed input tokens and unique non-embedding parameters alongside this estimate. Equality of token budgets alone does not establish equality of FLOPs to the published row.
+
+\paragraph{Gate and representation measurements.}
+For active positions, \(\rms(V)=\sqrt{\operatorname{mean}(V^2)}\).
+At the same forward observation and in exact arithmetic,
+\(\rms(Y_{\ell,j}-X_{\ell,j})=|\epsilon_{\ell,j}|\,\rms(\Delta_{\ell,j})\).
+The default diagnostic samples up to 16 evenly spaced positions per block on the first microbatch of each logging interval per worker. The logged gate value is the current parameter at the end of that interval. To test the preceding equality numerically, align the gate value to the same forward pass. The signed gradient, when exposed, is captured after clipping and before the optimizer update. Plots use cumulative input tokens on the horizontal axis and retain per-seed traces.
+
+\begin{table}[htbp]
+\centering
+\caption{Reserved full-budget paired results. NLL differences are in nats; differences in downstream family-average accuracy are in percentage points. SD denotes the sample standard deviation across seed differences.}
+\label{tab:pairs}
+\small
+\begin{tabular}{@{}lrrrrr@{}}
+\toprule
+Layer-specific minus stage-shared & Seed 1234 & Seed 1235 & Seed 1236 & Mean & SD\\
+\midrule
+FineWeb NLL & \pending & \pending & \pending & \pending & \pending\\
+Downstream average & \pending & \pending & \pending & \pending & \pending\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Running and reporting the study.}
+From the project root, the following command schedules both main runs and the five-method short panel for each of the three default seeds. A repeated invocation resumes interrupted runs. The reproducible implementation is pinned in the project repository \citep{implementation}.
+\begin{quote}\small
+\verb|bash scripts/run_npu.sh all 0,1,2,3,4,5,6,7| \verb|\|\\
+\verb|  --paper-comparison --ablation-steps 512|
+\end{quote}
+Use \code{--ablations-only} to run the short panel alone, and \code{--eval-only} with the same settings to score retained checkpoints. Record the chosen short endpoint, accelerator type and count, software versions, and dataset revisions with the results. Checkpoints retain model and training state together with dataset continuation information. Rank-zero \code{training_metrics.jsonl} files provide the training curves. The matched-step \code{.ablations.csv} supplies seed-matched early NLL contrasts, and the full-step \code{.paper.json} supplies per-seed metrics, work records and paired summaries. The \code{.table3-rows.tex} fragment supplies the two verified local rows for Table~\ref{tab:main} after a complete full-budget evaluation. The published reference remains separately attributed. An optional rescoring of the authors' checkpoint is a distinct observation and should be labeled as such.
+
+\begin{thebibliography}{99}\small
+\bibitem[Bae et~al.(2025a)]{bae2025mor}
+S.~Bae, Y.~Kim, R.~Bayat, S.~Kim, J.~Ha, T.~Schuster, A.~Fisch, H.~Harutyunyan, Z.~Ji, A.~Courville and S.-Y.~Yun.
+\href{https://papers.nips.cc/paper_files/paper/2025/hash/8b08bbf8b420faa6eeb4020720582ec7-Abstract-Conference.html}{Mixture-of-Recursions: Learning Dynamic Recursive Depths for Adaptive Token-Level Computation}. NeurIPS, 2025.
+
+\bibitem[Bachlechner et~al.(2021)]{rezero}
+T.~Bachlechner, B.~P.~Majumder, H.~Mao, G.~Cottrell and J.~McAuley.
+\href{https://proceedings.mlr.press/v161/bachlechner21a.html}{ReZero is all you need: Fast convergence at large depth}. UAI, PMLR 161, pp.~1352--1361, 2021.
+
+\bibitem[Dehghani et~al.(2019)]{universal}
+M.~Dehghani, S.~Gouws, O.~Vinyals, J.~Uszkoreit and {\L}.~Kaiser.
+\href{https://arxiv.org/abs/1807.03819}{Universal Transformers}. ICLR, 2019.
+
+\bibitem[Bae et~al.(2025b)]{relaxed}
+S.~Bae, A.~Fisch, H.~Harutyunyan, Z.~Ji, S.~Kim and T.~Schuster.
+\href{https://proceedings.iclr.cc/paper_files/paper/2025/hash/54d6a55225cebbdc16fbb0e45c5bdf2b-Abstract-Conference.html}{Relaxed Recursive Transformers: Effective Parameter Sharing with Layer-wise LoRA}. ICLR, 2025.
+
+\bibitem[Raposo et~al.(2024)]{mod}
+D.~Raposo, S.~Ritter, B.~Richards, T.~Lillicrap, P.~C.~Humphreys and A.~Santoro.
+\href{https://arxiv.org/abs/2404.02258}{Mixture-of-Depths: Dynamically allocating compute in transformer-based language models}. arXiv:2404.02258, 2024.
+
+\bibitem[Touvron et~al.(2021)]{layerscale}
+H.~Touvron, M.~Cord, A.~Sablayrolles, G.~Synnaeve and H.~J\'egou.
+\href{https://openaccess.thecvf.com/content/ICCV2021/html/Touvron_Going_Deeper_With_Image_Transformers_ICCV_2021_paper.html}{Going Deeper with Image Transformers}. ICCV, 2021.
+
+\bibitem[Jeddi et~al.(2026)]{loopformer}
+A.~Jeddi, M.~Ciccone and B.~Taati.
+\href{https://openreview.net/forum?id=RzYXb5YWBs}{LoopFormer: Elastic-Depth Looped Transformers for Latent Reasoning via Shortcut Modulation}. ICLR, 2026.
+
+\bibitem[Yao et~al.(2026)]{arloop}
+Y.~Yao, Y.~Du, D.~Zhu and H.~Sun.
+\href{https://arxiv.org/abs/2611.05234}{ARLoop: Fully-Open Pre-trained Looped Transformers with Attention Residuals}. arXiv:2611.05234, 2026.
+
+\bibitem[Penedo et~al.(2024)]{fineweb}
+G.~Penedo, H.~Kydl\'i\v{c}ek, L.~Ben Allal, A.~Lozhkov, M.~Mitchell, C.~Raffel, L.~von Werra and T.~Wolf.
+\href{https://arxiv.org/abs/2406.17557}{The FineWeb Datasets: Decanting the Web for the Finest Text Data at Scale}. NeurIPS Datasets and Benchmarks Track, 2024.
+
+\bibitem[Hugging Face(2024a)]{smolcorpus}
+Hugging Face. \href{https://huggingface.co/datasets/HuggingFaceTB/smollm-corpus}{SmolLM-Corpus}. Dataset release, 2024.
+
+\bibitem[Hugging Face(2024b)]{smolconfig}
+Hugging Face. \href{https://huggingface.co/HuggingFaceTB/SmolLM-360M/blob/1182e7e/config.json}{SmolLM-360M model configuration}. Model release, 2024.
+
+\bibitem[Kim(n.d.)]{finewebtest}
+\texttt{kimyuji}. \href{https://huggingface.co/datasets/kimyuji/fineweb-test}{FineWeb test corpus used by the MoR evaluation pipeline}. Dataset release.
+
+\bibitem[Paperno et~al.(2016)]{lambada}
+D.~Paperno et~al. \href{https://aclanthology.org/P16-1144/}{The LAMBADA dataset: Word prediction requiring a broad discourse context}. ACL, 2016.
+
+\bibitem[Zellers et~al.(2019)]{hellaswag}
+R.~Zellers, A.~Holtzman, Y.~Bisk, A.~Farhadi and Y.~Choi. \href{https://aclanthology.org/P19-1472/}{HellaSwag: Can a Machine Really Finish Your Sentence?} ACL, 2019.
+
+\bibitem[Bisk et~al.(2020)]{piqa}
+Y.~Bisk, R.~Zellers, R.~Le Bras, J.~Gao and Y.~Choi. \href{https://arxiv.org/abs/1911.11641}{PIQA: Reasoning about physical commonsense in natural language}. AAAI, 2020.
+
+\bibitem[Sakaguchi et~al.(2020)]{winogrande}
+K.~Sakaguchi, R.~Le Bras, C.~Bhagavatula and Y.~Choi. \href{https://arxiv.org/abs/1907.10641}{WinoGrande: An adversarial Winograd schema challenge at scale}. AAAI, 2020.
+
+\bibitem[Clark et~al.(2018)]{arc}
+P.~Clark et~al. \href{https://arxiv.org/abs/1803.05457}{Think you have solved question answering? Try ARC, the AI2 reasoning challenge}. arXiv:1803.05457, 2018.
+
+\bibitem[Hendrycks et~al.(2021)]{mmlu}
+D.~Hendrycks, C.~Burns, S.~Basart, A.~Zou, M.~Mazeika, D.~Song and J.~Steinhardt. \href{https://arxiv.org/abs/2009.03300}{Measuring massive multitask language understanding}. ICLR, 2021.
+
+\bibitem[Project implementation(2026)]{implementation}
+\href{https://github.com/fangyihao/mixture_of_recursions/tree/1d798879b0afd0d844c7f19dfcfa20189dd302d7}{Recursive residual gates in Mixture-of-Recursions}. Source release, commit \code{1d79887}, 2026.
+\end{thebibliography}
+\end{document}

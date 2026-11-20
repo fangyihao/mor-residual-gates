@@ -72,6 +72,8 @@ Run the CPU regression suite with `python -m pytest -q tests/test_recursive_resi
 
 ### Compare ReZero with the published MoR result
 
+The [LaTeX manuscript](paper/recursive_residual_gates.tex) documents the methods and evaluation protocol, with placeholders for the study results. Build it from `paper/` with `latexmk -pdf recursive_residual_gates.tex`.
+
 Use `--paper-comparison` for the main experiment. It inherits the authors’ released SmolLM-360M configuration for the **Table 3 fixed-FLOPs, Expert / Cache / Middle-Cycle / K=3** row. The published MoR model has 118M non-embedding parameters and scores **2.7925 FineWeb NLL** and **42.6%** mean downstream accuracy after approximately 30B tokens at $16.5 \times 10^{18}$ training FLOPs. The released recipe trains from scratch on FineWeb-Edu for 14,161 optimizer steps, with 1,024 sequences of 2,048 tokens per global batch (29,697,769,472 input tokens). The pretrained sequence-sharing experiment above addresses the separate question of preserving a pretrained first pass. [Paper, Table 3 and Appendix D](https://papers.nips.cc/paper_files/paper/2025/file/8b08bbf8b420faa6eeb4020720582ec7-Paper-Conference.pdf) · [Released training configuration](https://github.com/raymin0223/mixture_of_recursions/blob/82c97f29cd140efa01f5cc4fe0de73a4c3b6ffd6/conf/pretrain/250720_pretrain_smollm-360m_rec3_middle_cycle_random_lr3e-3_mor_expert_linear_alpha_0.1_sigmoid_aux_loss_0.001.yaml)
 
 | Local method | What the comparison tests |
