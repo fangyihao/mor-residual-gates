@@ -6,6 +6,7 @@ from statistics import mean, stdev
 
 from omegaconf import OmegaConf
 
+from scripts.paper_table3 import FLOP_CONVENTION, METRICS, forward_work, write_table3
 from util.resume import weight_files
 
 RELEASED_CONFIG = "250720_pretrain_smollm-360m_rec3_middle_cycle_random_lr3e-3_mor_expert_linear_alpha_0.1_sigmoid_aux_loss_0.001"
@@ -40,8 +41,7 @@ def summary(values):
 def paired_results(rows):
     by_method = {(r["seed"], r["method"]): r for r in rows}
     comparisons = {}
-    for method, control in (("rezero", "original_mor"), ("rezero_stage", "original_mor"), ("full", "original_mor"),
-                            ("rezero", "full"), ("rezero_stage", "full"), ("rezero", "rezero_stage")):
+    for method, control in (("rezero", "original_mor"), ("rezero_stage", "original_mor"), ("rezero", "rezero_stage")):
         pairs = {}
         for row in rows:
             if row["method"] != method:
@@ -82,11 +82,11 @@ def weight_digests(directory):
 
 
 def write_table(path, result):
-    columns = ("fineweb_nll", "LD", "HS", "PQ", "WG", "ARC", "MMLU", "Avg")
-    lines = ["# MoR comparison", "", "| Source | Method | Seeds | Training tokens | FineWeb NLL ↓ | LD | HS | PQ | WG | ARC | MMLU | Avg ↑ |",
-             "|---|---|---:|---:|" + "---:|" * len(columns)]
+    columns = METRICS
+    lines = ["# MoR comparison", "", "| Source | Method | Seeds | Training tokens | Forward FLOPs (10^18) | FineWeb NLL ↓ | LD | HS | PQ | WG | ARC | MMLU | Avg ↑ |",
+             "|---|---|---:|---:|---:|" + "---:|" * len(columns)]
 
-    def add_row(source, method, seeds, tokens, metrics):
+    def add_row(source, method, seeds, tokens, flops, metrics):
         values = []
         for col in columns:
             if col not in metrics:
@@ -101,22 +101,25 @@ def write_table(path, result):
             else:
                 label = f"{value:.{digits}f}"
             values.append(label)
-        lines.append("| " + " | ".join([source, method, str(seeds), tokens, *values]) + " |")
+        lines.append("| " + " | ".join([source, method, str(seeds), tokens, flops, *values]) + " |")
 
-    add_row("Bae et al., Table 3", "MoR", "—", "30B (reported)", PUBLISHED["metrics"])
+    add_row("Bae et al., Table 3", "MoR", "—", "30B (reported)", "16.5 (reported)", PUBLISHED["metrics"])
     if "authors_checkpoint_rescored" in result:
-        add_row("Supplied MoR checkpoint scored locally", "MoR", "—", "—", result["authors_checkpoint_rescored"]["metrics"])
+        add_row("Supplied MoR checkpoint scored locally", "MoR", "—", "—", "—", result["authors_checkpoint_rescored"]["metrics"])
     for mode, metrics in result["local_summary"].items():
         counts = [row["input_tokens"] for row in result["local_runs"] if row["method"] == mode]
         tokens = "—" if None in counts else (f"{min(counts):,}" if min(counts) == max(counts)
                                               else f"{min(counts):,}–{max(counts):,}")
-        add_row("Local training", mode, metrics["fineweb_nll"]["n"], tokens, metrics)
+        estimates = [r["forward_work"] for r in result["local_runs"] if r["method"] == mode]
+        flops = (f"{mean(e['total'] for e in estimates) / 1e18:.3g} (est.)" if all(estimates) else "—")
+        add_row("Local training", mode, metrics["fineweb_nll"]["n"], tokens, flops, metrics)
     sequences = next(iter(result["evaluation_data"].values()))["packed_sequences"]
     lines += ["", f"Local NLL uses {sequences} packed sequences. Accuracy is reported in percent. "
               "Local entries show the mean and sample standard deviation across available training seeds.",
               "", "The accompanying JSON records training work, protocol differences and paired seed-level contrasts."]
     if any(row["recipe_changes"] or not row["released_token_budget_reached"] for row in result["local_runs"]):
         lines += ["", "**Modified recipe or training budget.** Treat the published row as context for these local runs."]
+    lines += ["", FLOP_CONVENTION, "", "Table 3 rows: " + result["table3_export_note"]]
     if result["benchmark_protocol"]:
         shots = sorted({n for b in result["benchmark_protocol"].values() for n in b["n_shot"].values() if isinstance(n, int)})
         lines += ["", f"Local harness shot counts observed across tasks: {shots}. Per-task counts are in the JSON. "
@@ -143,9 +146,13 @@ def write_report(root, runs, output, downstream, author_checkpoint=None):
         downstream_result = downstream.get(run.directory, {})
         changes = recipe_changes(saved, reference)
         tokens = total("input_tokens")
+        token_layers = total("executed_token_layers")
+        model_config = run.weights / "config.json"
+        work = (forward_work(json.loads(model_config.read_text()), saved.max_length, tokens, token_layers)
+                if model_config.is_file() and not saved.relaxation.enable else None)
         rows.append({"run": run.directory, "method": run.mode, "seed": run.seed, "step": state["global_step"],
                      "weights": str(run.weights.relative_to(directory)), "input_tokens": tokens,
-                     "executed_token_layers": total("executed_token_layers"),
+                     "executed_token_layers": token_layers, "forward_work": work,
                      "parameters": json.loads(count_path.read_text()) if count_path.is_file() else None,
                      "execution": {k: saved.get(k) for k in ("attn_implementation", "gradient_checkpointing",
                                                               "per_device_train_batch_size", "precision")},
@@ -155,12 +162,13 @@ def write_report(root, runs, output, downstream, author_checkpoint=None):
               "released_recipe_input_tokens": target_tokens, "evaluation_data": data,
               "benchmark_protocol": {k: {f: v for f, v in result.items() if f != "metrics"}
                                      for k, result in downstream.items()},
-              "accuracy_units": "percent", "local_runs": rows, "local_summary": method_summaries(rows),
+              "forward_flops_convention": FLOP_CONVENTION, "accuracy_units": "percent", "local_runs": rows, "local_summary": method_summaries(rows),
               "paired_local_differences": paired_results(rows)}
     if author_checkpoint:
         label = "authors_checkpoint_rescored"
         result[label] = {"weights": str(author_checkpoint), "weight_sha256": weight_digests(author_checkpoint), "metrics": {
             "fineweb_nll": losses[label], **downstream.get(label, {}).get("metrics", {})}}
+    result["table3_export_note"] = write_table3(output.with_suffix(".table3-rows.tex"), result)
     path = output.with_suffix(".paper.json")
     path.write_text(json.dumps(result, indent=2, allow_nan=False) + "\n")
     write_table(path.with_suffix(".md"), result)

@@ -14,6 +14,7 @@ from scripts.run_residual_suite import PAPER_METHODS, ROOT, plan, training_targe
 def test_paper_recipes_and_control_budgets():
     reference = OmegaConf.to_container(OmegaConf.load(ROOT / "conf/pretrain" / (RELEASED_CONFIG + ".yaml")))
     runs = plan("paper_mor", [], [1234], 3540)
+    assert PAPER_METHODS == ("original_mor", "rezero", "rezero_stage")
     assert [r.mode for r in runs] == [*PAPER_METHODS, "uniform", "power"]
     for run in runs:
         cfg = run.config
@@ -81,6 +82,9 @@ def test_report_keeps_historical_and_paired_estimates_distinct(tmp_path):
     assert delta["summary"]["fineweb_nll"]["mean"] == pytest.approx(0.15)
     assert delta["summary"]["fineweb_nll"]["n"] == 2
     assert "Modified recipe or training budget" in output.with_suffix(".paper.md").read_text()
+    assert set(report["paired_local_differences"]) == {
+        "rezero_minus_original_mor", "rezero_stage_minus_original_mor", "rezero_minus_rezero_stage"}
+    assert "modified training recipe or token budget" in output.with_suffix(".table3-rows.tex").read_text()
     rows = report["local_runs"]
     next(r for r in rows if r["seed"] == 1 and r["method"] == "original_mor")["input_tokens"] = 11
     assert paired_results(rows)["rezero_stage_minus_original_mor"]["summary"]["fineweb_nll"]["n"] == 1
@@ -114,3 +118,32 @@ def test_fewshot_override_reaches_every_mmlu_continuation_subject(monkeypatch):
                 yield node.get_config("num_fewshot")
 
     assert list(subjects(tree)) == [1] * 57
+
+
+def test_table3_latex_emits_only_paired_full_budget_rows(tmp_path):
+    from scripts.paper_comparison import method_summaries
+    from scripts.paper_table3 import LABELS, METRICS, write_table3
+
+    # Independent synthetic measurements in the published table's units.
+    rows = [{"method": method, "seed": seed, "step": 14161, "input_tokens": 29_697_769_472,
+             "executed_token_layers": 1000, "recipe_changes": {}, "released_token_budget_reached": True,
+             "parameters": {"non_embedding": 118_000_020}, "forward_work": {"total": 17_700_000_000_000_000_000},
+             "metrics": {k: (2.71 if k == "fineweb_nll" else 50) + 0.2 * seed for k in METRICS}}
+            for method in ("original_mor", *LABELS) for seed in (1, 2)]
+    report = {"local_runs": rows, "local_summary": method_summaries(rows),
+              "evaluation_data": {"local": {"packed_sequences": 500}},
+              "benchmark_protocol": {"local": {"n_shot": {"test": 0}}}}
+    path = tmp_path / "table3-rows.tex"
+    write_table3(path, report)
+    body = [line for line in path.read_text().splitlines() if not line.startswith("%")]
+    assert len(body) == 2
+    for row, label in zip(body, LABELS.values(), strict=True):
+        assert row.endswith(r"\\")
+        fields = row[:-2].strip().split(" & ")
+        assert fields == [label, "Expert", "Cache", "M-Cyc", "3", "118M", "17.7$^{*}$", "29.70B", "3.0100",
+                          *(["50.3"] * 7)]
+    rows[-1]["metrics"].pop("HS")
+    assert "incomplete" in write_table3(path, report)
+    assert all(line.startswith("%") for line in path.read_text().splitlines())
+    rows.pop()
+    assert "same set of training seeds" in write_table3(path, report)

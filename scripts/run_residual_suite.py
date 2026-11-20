@@ -17,7 +17,7 @@ sys.path.insert(0, str(ROOT))
 from util.resume import checkpoint_step, evaluation_weights, has_weights, same_recipe, weights_at_step
 
 MODES = ("rezero", "rezero_stage", "full", "uniform", "power")
-PAPER_METHODS = ("original_mor", "full", "rezero", "rezero_stage")
+PAPER_METHODS = ("original_mor", "rezero", "rezero_stage")
 DEFAULT_SEEDS = (1234, 1235, 1236)
 
 
@@ -50,7 +50,7 @@ def plan(config_name, overrides, seeds, ablation_steps=None, full_budget_control
     keys = {arg.partition("=")[0].lstrip("+~") for arg in overrides}
     paper = config_name == "paper_mor"
     if paper and full_budget_control is not None:
-        raise ValueError("The paper comparison keeps original_mor, full and both ReZero variants at full budget.")
+        raise ValueError("The paper comparison keeps original_mor and both ReZero variants at full budget.")
     if paper and ("paper_method" in keys or "recursive.residual" in keys):
         raise ValueError("The paper comparison sets the method and recursive residual per run.")
     if full_budget_control is not None and ablation_steps is None:

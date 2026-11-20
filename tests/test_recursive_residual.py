@@ -399,3 +399,35 @@ def test_checkpoint_formats_and_shards(tmp_path, legacy):
     load_model_weights(target, tmp_path)
     for name, value in source.state_dict().items():
         torch.testing.assert_close(target.state_dict()[name], value, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("mode", [None, "rezero", "rezero_stage"])
+def test_table3_forward_flops_against_executed_module_shapes(mode):
+    from contextlib import ExitStack
+    from scripts.paper_table3 import forward_work
+
+    model, _ = tiny_model(mode)
+    batch, length = 2, 11
+    counts = Counter()
+
+    def count(module, args):
+        x = args[0]
+        if isinstance(module, nn.Linear):
+            counts["matrix"] += 2 * x.numel() * module.out_features
+        else:
+            b, s, _ = x.shape
+            counts["token_layers"] += b * s
+            pairs = s * (s + 1) // 2
+            counts["attention"] += b * pairs * 4 * module.self_attn.q_proj.out_features
+
+    with ExitStack() as hooks, torch.no_grad():
+        for module in model.modules():
+            if isinstance(module, (nn.Linear, LlamaDecoderLayer)):
+                hooks.enter_context(module.register_forward_pre_hook(count))
+        model.eval()(input_ids=torch.arange(length).repeat(batch, 1), use_cache=False)
+    cfg = model.config.to_dict()
+    work = forward_work(cfg, length, batch * length, counts["token_layers"])
+    assert work["total"] == counts["matrix"] + counts["attention"]
+    assert work["components"]["causal_attention"] == counts["attention"]
+    assert work["tokens_per_stage"] == [11, 7, 3]
+    assert forward_work(cfg, length, batch * length, counts["token_layers"] + 1) is None

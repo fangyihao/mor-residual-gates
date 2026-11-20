@@ -222,10 +222,10 @@ def test_reject_latest_as_missing_ablation(tmp_path, monkeypatch):
         suite.completed(run)
 
 
-def test_npu_paper_preset_reaches_all_four_train_launches(launch):
+def test_npu_paper_preset_reaches_all_three_train_launches(launch):
     result, calls = launch("npu", ["--train-only", "--paper-comparison", "seed=31"])
     assert result.returncode == 0, result.stderr
-    assert len(calls) == 4
-    for (_, args, _), method in zip(calls, ("original_mor", "full", "rezero", "rezero_stage"), strict=True):
+    assert len(calls) == 3
+    for (_, args, _), method in zip(calls, ("original_mor", "rezero", "rezero_stage"), strict=True):
         assert args[args.index("--config-name") + 1] == "paper_mor"
         assert f"paper_method={method}" in args
