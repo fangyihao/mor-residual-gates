@@ -10,6 +10,7 @@ from transformers.masking_utils import create_causal_mask
 from transformers.utils import ModelOutput, TransformersKwargs, logging
 from typing_extensions import Unpack
 
+from model.base_model.modeling_llama import run_decoder_block
 from model.kv_caches.cache_utils import prepare_cache
 from model.recursive_model.modeling_llama import LlamaModel, LlamaForCausalLM
 from model.recursive_residual import configure_residual_layers
@@ -140,7 +141,10 @@ class MoRLlamaModel(LlamaModel):
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
-        if self.gradient_checkpointing and self.training and use_cache:
+        checkpoint_block = self._gradient_checkpointing_func if self.gradient_checkpointing and self.training else None
+        if checkpoint_block is not None and past_key_values is not None:
+            raise ValueError("Training with gradient checkpointing requires a full sequence without past_key_values.")
+        if checkpoint_block is not None and use_cache:
             logger.warning_once(
                 "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`."
             )
@@ -189,71 +193,55 @@ class MoRLlamaModel(LlamaModel):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            checkpointing = self.gradient_checkpointing and self.training
-            checkpoint_blocks = checkpointing and getattr(decoder_layer, "residual_recursion", False)
-            if checkpointing and not checkpoint_blocks:
-                # Legacy routing configurations retain their checkpoint path.
-                layer_outputs = self._gradient_checkpointing_func(
-                    decoder_layer.__call__,
+            if getattr(decoder_layer, "mor", False):
+                layer_outputs = decoder_layer(
                     hidden_states,
-                    causal_mask,
-                    position_ids,
-                    past_key_values,
-                    output_attentions,
-                    use_cache,
-                    cache_position,
-                    position_embeddings,
+                    attention_mask=causal_mask,
+                    position_ids=position_ids,
+                    past_key_value=past_key_values,
+                    output_attentions=output_attentions,
+                    use_cache=use_cache,
+                    cache_position=cache_position,
+                    position_embeddings=position_embeddings,
+                    prev_selected_tokens=None if getattr(decoder_layer, "first_stage", False) else prev_selected_tokens,
+                    checkpoint_block=checkpoint_block,
+                    cache_prefix=past_seen_tokens,
+                    **flash_attn_kwargs,
                 )
+                if decoder_layer.mor_type == "expert":
+                    prev_selected_tokens = layer_outputs.selected_tokens
+                    if layer_outputs.sampling_loss is not None:
+                        sampling_loss += layer_outputs.sampling_loss
+                    if layer_outputs.sampling_acc is not None:
+                        sampling_acc_list.append(layer_outputs.sampling_acc)
+                    if layer_outputs.sampling_topk_acc is not None:
+                        sampling_topk_acc_list.append(layer_outputs.sampling_topk_acc)
+                    # if layer_outputs.uniformity is not None:
+                    #     uniformity += layer_outputs.uniformity
+                    # if layer_outputs.dead_token_seq is not None:
+                    #     dead_token_seq = layer_outputs.dead_token_seq
+                    if layer_outputs.router_z_loss is not None:
+                        router_z_loss += layer_outputs.router_z_loss
+
+                elif decoder_layer.mor_type == "token":
+                    if layer_outputs.balancing_loss is not None:
+                        balancing_loss += layer_outputs.balancing_loss
+                    if layer_outputs.balancing_ratio is not None:
+                        balancing_ratios.append(layer_outputs.balancing_ratio)
+                    if layer_outputs.router_z_loss is not None:
+                        router_z_loss += layer_outputs.router_z_loss
             else:
-                if hasattr(decoder_layer, "mor") and decoder_layer.mor:
-                    layer_outputs = decoder_layer(
-                        hidden_states,
-                        attention_mask=causal_mask,
-                        position_ids=position_ids,
-                        past_key_value=past_key_values,
-                        output_attentions=output_attentions,
-                        use_cache=use_cache,
-                        cache_position=cache_position,
-                        position_embeddings=position_embeddings,
-                        prev_selected_tokens=None if getattr(decoder_layer, "first_stage", False) else prev_selected_tokens,
-                        checkpoint_block=self._gradient_checkpointing_func if checkpoint_blocks else None,
-                        cache_prefix=past_seen_tokens,
-                        **flash_attn_kwargs,
-                    )
-                    if decoder_layer.mor_type == "expert":
-                        prev_selected_tokens = layer_outputs.selected_tokens
-                        if layer_outputs.sampling_loss is not None:
-                            sampling_loss += layer_outputs.sampling_loss
-                        if layer_outputs.sampling_acc is not None:
-                            sampling_acc_list.append(layer_outputs.sampling_acc)
-                        if layer_outputs.sampling_topk_acc is not None:
-                            sampling_topk_acc_list.append(layer_outputs.sampling_topk_acc)
-                        # if layer_outputs.uniformity is not None:
-                        #     uniformity += layer_outputs.uniformity
-                        # if layer_outputs.dead_token_seq is not None:
-                        #     dead_token_seq = layer_outputs.dead_token_seq
-                        if layer_outputs.router_z_loss is not None:
-                            router_z_loss += layer_outputs.router_z_loss
-                            
-                    elif decoder_layer.mor_type == "token":
-                        if layer_outputs.balancing_loss is not None:
-                            balancing_loss += layer_outputs.balancing_loss
-                        if layer_outputs.balancing_ratio is not None:
-                            balancing_ratios.append(layer_outputs.balancing_ratio)
-                        if layer_outputs.router_z_loss is not None:
-                            router_z_loss += layer_outputs.router_z_loss
-                else:
-                    layer_outputs = decoder_layer(
-                        hidden_states,
-                        attention_mask=causal_mask,
-                        position_ids=position_ids,
-                        past_key_value=past_key_values,
-                        output_attentions=output_attentions,
-                        use_cache=use_cache,
-                        cache_position=cache_position,
-                        position_embeddings=position_embeddings,
-                        **flash_attn_kwargs,
-                    )
+                layer_outputs = run_decoder_block(
+                    decoder_layer, hidden_states, checkpoint_block,
+                    attention_mask=causal_mask,
+                    position_ids=position_ids,
+                    past_key_value=past_key_values,
+                    output_attentions=output_attentions,
+                    use_cache=use_cache,
+                    cache_position=cache_position,
+                    position_embeddings=position_embeddings,
+                    **flash_attn_kwargs,
+                )
 
             hidden_states = layer_outputs[0]
 

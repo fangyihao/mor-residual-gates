@@ -10,7 +10,8 @@ from typing_extensions import Unpack
 from transformers.utils import TransformersKwargs
 
 from model.kv_caches.cache_utils import Cache, RoutedDynamicCache
-from model.mor_model.util import ROUTER_TYPES, MoRLayerOutputWithPast, run_decoder_block
+from model.base_model.modeling_llama import run_decoder_block
+from model.mor_model.util import ROUTER_TYPES, MoRLayerOutputWithPast
 from util.misc import get_torch_dtype
 
 

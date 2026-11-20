@@ -19,27 +19,24 @@ else
 fi
 echo "INFO: WANDB_MODE is set to '$WANDB_MODE'"
 
-# Use the first argument as GPU numbers.
+# Optional Hydra overrides after -- apply to every selected preset.
+if [[ $# -lt 2 || -z "$1" || "$2" == -- ]]; then
+  echo "Usage: $0 [accelerate|deepspeed] [online|offline] GPU_IDS CONFIG [CONFIG ...] [-- HYDRA_OVERRIDE ...]" >&2
+  exit 1
+fi
 gpu_numbers="$1"
-
-# Use all arguments after the first one as config-names.
-shift # Remove the first argument
-
-# Check if GPU numbers are provided.
-if [ -z "$gpu_numbers" ]; then
-  echo "Usage: $0 <GPU numbers> <config name 1> <config name 2> ..."
-  exit 1
-fi
+shift
 num_processes=$(echo "$gpu_numbers" | tr ',' '\n' | grep -c .)
-
-# Check if at least one config-name argument is provided.
-if [ $# -eq 0 ]; then
-  echo "Usage: $0 <GPU numbers> <config name 1> <config name 2> ..."
-  exit 1
+config_names=()
+while [[ $# -gt 0 && "$1" != -- ]]; do
+  config_names+=("$1")
+  shift
+done
+if [[ $# -gt 0 ]]; then
+  shift
 fi
 
-# Loop through each config-name argument and execute the command.
-for config_name in "$@"; do
+for config_name in "${config_names[@]}"; do
   # Generate a 5-digit random port.
   random_port=$((10000 + RANDOM % 90000))
 
@@ -48,15 +45,15 @@ for config_name in "$@"; do
 
   if [ "$launcher_type" == "deepspeed" ]; then
     echo "Launch with DeepSpeed..."
-    HYDRA_FULL_ERROR=1 deepspeed --include "localhost:$gpu_numbers" --no_local_rank --master_port "$random_port" pretrain.py --config-name "$config_name"
+    HYDRA_FULL_ERROR=1 deepspeed --include "localhost:$gpu_numbers" --no_local_rank --master_port "$random_port" pretrain.py --config-name "$config_name" "$@"
   elif [ "$launcher_type" == "accelerate" ]; then
     echo "Launch with accelerate..."
     if [ "$num_processes" -eq 1 ]; then
       # Use single GPU config for single process.
-      HYDRA_FULL_ERROR=1 accelerate launch --config_file acc_configs/single_gpu_config.yaml --gpu_ids $gpu_numbers --num_processes $num_processes --main_process_port "$random_port" pretrain.py --config-name "$config_name"
+      HYDRA_FULL_ERROR=1 accelerate launch --config_file acc_configs/single_gpu_config.yaml --gpu_ids $gpu_numbers --num_processes $num_processes --main_process_port "$random_port" pretrain.py --config-name "$config_name" "$@"
     else
       # Use default config for multiple processes.
-      HYDRA_FULL_ERROR=1 accelerate launch --config_file acc_configs/default_config.yaml --gpu_ids $gpu_numbers --num_processes $num_processes --main_process_port "$random_port" pretrain.py --config-name "$config_name"
+      HYDRA_FULL_ERROR=1 accelerate launch --config_file acc_configs/default_config.yaml --gpu_ids $gpu_numbers --num_processes $num_processes --main_process_port "$random_port" pretrain.py --config-name "$config_name" "$@"
     fi
   fi
   # Optional: Add a delay after each config execution.

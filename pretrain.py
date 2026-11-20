@@ -118,6 +118,7 @@ def main(cfg: DictConfig):
         ds_config.pop("optimizer", None)
     if cfg.get("tensorboard"):
         os.environ["TENSORBOARD_LOGGING_DIR"] = str(cfg.tensorboard_dir)
+    routed = cfg.get("mor", {}).get("enable")
     train_args = TrainingArguments(
         seed=cfg.get("seed", 42),
         lr_scheduler_type=cfg.get("lr_scheduler_type", "cosine_with_min_lr"),
@@ -135,8 +136,8 @@ def main(cfg: DictConfig):
         save_total_limit=cfg.save_total_limit,
         gradient_accumulation_steps=cfg.gradient_accumulation_steps,
         activation_checkpointing=cfg.gradient_checkpointing,
-        activation_checkpointing_kwargs={"use_reentrant": False} if residual is not None else None,
-        ddp_find_unused_parameters=True if residual is not None and cfg.get("mor", {}).get("enable") else None,
+        activation_checkpointing_kwargs={"use_reentrant": False} if cfg.gradient_checkpointing else None,
+        ddp_find_unused_parameters=True if routed and (residual is not None or cfg.gradient_checkpointing) else None,
         max_grad_norm=cfg.max_grad_norm,
         dataloader_num_workers=cfg.dataloader_num_workers,
         bf16=cfg.precision == "bf16",

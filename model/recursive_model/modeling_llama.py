@@ -12,7 +12,7 @@ from model.kv_caches.cache_utils import prepare_cache
 from transformers.generation import GenerationMixin
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from transformers.models.llama.modeling_llama import LlamaPreTrainedModel, LlamaRMSNorm, LlamaRotaryEmbedding
-from model.base_model.modeling_llama import LlamaDecoderLayer
+from model.base_model.modeling_llama import LlamaDecoderLayer, run_decoder_block
 from model.recursive_residual import install_residual_layers
 from util.checkpoint import expand_shared_weights, parameter_aliases
 
@@ -75,7 +75,10 @@ class LlamaModel(LlamaPreTrainedModel):
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
-        if self.gradient_checkpointing and self.training and use_cache:
+        checkpoint_block = self._gradient_checkpointing_func if self.gradient_checkpointing and self.training else None
+        if checkpoint_block is not None and past_key_values is not None:
+            raise ValueError("Training with gradient checkpointing requires a full sequence without past_key_values.")
+        if checkpoint_block is not None and use_cache:
             logger.warning_once(
                 "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`."
             )
@@ -114,30 +117,17 @@ class LlamaModel(LlamaPreTrainedModel):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            if self.gradient_checkpointing and self.training:
-                layer_outputs = self._gradient_checkpointing_func(
-                    decoder_layer.__call__,
-                    hidden_states,
-                    causal_mask,
-                    position_ids,
-                    past_key_values,
-                    output_attentions,
-                    use_cache,
-                    cache_position,
-                    position_embeddings,
-                )
-            else:
-                layer_outputs = decoder_layer(
-                    hidden_states,
-                    attention_mask=causal_mask,
-                    position_ids=position_ids,
-                    past_key_value=past_key_values,
-                    output_attentions=output_attentions,
-                    use_cache=use_cache,
-                    cache_position=cache_position,
-                    position_embeddings=position_embeddings,
-                    **flash_attn_kwargs,
-                )
+            layer_outputs = run_decoder_block(
+                decoder_layer, hidden_states, checkpoint_block,
+                attention_mask=causal_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_values,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
+                **flash_attn_kwargs,
+            )
 
             hidden_states = layer_outputs[0]
 

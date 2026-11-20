@@ -1,4 +1,5 @@
 """CPU regression tests using tiny real decoder blocks and deterministic routes."""
+from collections import Counter
 from copy import deepcopy
 from pathlib import Path
 
@@ -8,6 +9,7 @@ from omegaconf import OmegaConf
 from torch import nn
 from transformers import LlamaConfig, LlamaForCausalLM as HFLlamaForCausalLM, TrainingArguments
 
+from model.base_model.modeling_llama import LlamaDecoderLayer
 from model.mor_model.modeling_llama import MoRLlamaForCausalLM
 from model.recursive_model.modeling_llama import LlamaForCausalLM
 from model.recursive_residual import stage_scales
@@ -167,6 +169,70 @@ def test_sparse_routes_match_fixed_ablations(router):
             gate.data.fill_(scale)
         torch.testing.assert_close(model(ids).logits, reference(ids).logits)
         assert not gates(reference)
+
+
+@pytest.mark.parametrize("router", ["expert", "token", None])
+@pytest.mark.parametrize("mode", ["rezero", "full", "uniform", "power", None])
+def test_checkpoint_replays_only_decoder_blocks_and_preserves_gradients(router, mode):
+    reference, cfg = tiny_model(mode=mode, router=router)
+    cfg.mor.z_loss = True
+    reference.get_input_embeddings().weight.requires_grad_(False)
+    for module in reference.modules():
+        if isinstance(module, LlamaDecoderLayer):
+            module.self_attn.attention_dropout = 0.125
+    checkpointed = deepcopy(reference)
+    checkpointed.activation_checkpointing_enable({"use_reentrant": False})
+    ids = torch.arange(24).view(3, 8)
+    batch_tokens = torch.tensor(ids.numel() - len(ids))
+
+    def run(model):
+        calls = []
+        hooks = [
+            block.register_forward_pre_hook(lambda mod, args: calls.append(mod))
+            for block in model.modules() if isinstance(block, LlamaDecoderLayer)
+        ]
+        torch.manual_seed(17)
+        result = model(ids, labels=ids, num_items_in_batch=batch_tokens)
+        forward_count = len(calls)
+        forward_calls = Counter(calls)
+        loss = result.loss
+        if router:
+            loss = loss + result.sampling_loss + result.balancing_loss + result.router_z_loss
+        loss.backward()
+        for hook in hooks:
+            hook.remove()
+        assert forward_calls
+        backward_calls = Counter(calls[forward_count:])
+        assert backward_calls == (forward_calls if model.is_activation_checkpointing else Counter())
+        assert all(m.training_step == 1 for m in model.modules() if getattr(m, "mor", False))
+        return result
+
+    expected, actual = run(reference), run(checkpointed)
+    fields = ["logits", "loss"]
+    if router:
+        fields += ["sampling_loss", "balancing_loss", "balancing_ratio", "router_z_loss"]
+    for field in fields:
+        torch.testing.assert_close(actual[field], expected[field], atol=0, rtol=0)
+    expected_params = dict(reference.named_parameters())
+    for name, param in checkpointed.named_parameters():
+        torch.testing.assert_close(param.grad, expected_params[name].grad, atol=0, rtol=0, msg=name)
+
+
+@pytest.mark.parametrize("router", ["expert", "token", None])
+def test_checkpointing_cache_is_training_only(router):
+    model, _ = tiny_model(router=router)
+    model.activation_checkpointing_enable({"use_reentrant": False})
+    ids = torch.arange(8).view(1, -1)
+    with torch.no_grad():
+        prefix = model.eval()(ids, use_cache=True)
+        suffix = model(ids[:, :1], past_key_values=prefix.past_key_values, use_cache=True)
+    assert suffix.past_key_values.get_seq_length() == 9
+    model.train()
+    with pytest.raises(ValueError, match="past_key_values"):
+        model(ids, past_key_values=suffix.past_key_values)
+    assert suffix.past_key_values.get_seq_length() == 9
+    result = model(ids, use_cache=True, num_items_in_batch=torch.tensor(7))
+    assert result.past_key_values is None
 
 
 @pytest.mark.parametrize("router", ["expert", "token"])

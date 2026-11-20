@@ -1,4 +1,5 @@
 """Llama blocks with optional whole-block residual scaling and physical KV sharing."""
+from functools import partial
 from typing import Optional, Tuple
 
 import torch
@@ -14,6 +15,13 @@ from transformers.utils import TransformersKwargs
 from typing_extensions import Unpack
 
 from model.kv_caches.cache_utils import RecursiveDynamicCache, RoutedDynamicCache
+
+
+def run_decoder_block(block, hidden_states, checkpoint_block, **kwargs):
+    if checkpoint_block is None:
+        return block(hidden_states, **kwargs)
+    # Recompute just the decoder block. Routing and capacity warmup run once.
+    return checkpoint_block(partial(block.__call__, **kwargs), hidden_states)
 
 
 class LlamaAttention(HFLlamaAttention):

@@ -73,6 +73,18 @@ model = MoRLlamaForCausalLM.from_pretrained(
 Run the CPU regression suite with `python -m pytest -q tests/test_recursive_residual.py`. It uses tiny local Llama checkpoints to test pretrained preservation, sparse routing, signed gates, fixed coefficients, checkpoint restoration, and optimizer grouping.
 
 
+### Gradient checkpointing
+
+Append `gradient_checkpointing=true` to a training command to save activation memory by recomputing decoder blocks during backward. The default is `false`. The same option works for ReZero and all three fixed ablations. Each router selects tokens and updates its warmup counter once per forward pass. Checkpointed training uses full input sequences with the KV cache disabled.
+
+```bash
+# Two GPUs
+bash scripts/pretrain.sh accelerate offline 0,1 recursive_residual -- gradient_checkpointing=true name=gpu_rezero_gc
+
+# Eight Ascend NPUs
+bash scripts/run_npu.sh train 0,1,2,3,4,5,6,7 gradient_checkpointing=true name=ascend_rezero_gc
+```
+
 ### Ascend NPU training and FineWeb evaluation
 
 Use an Ascend environment with the driver and CANN runtime active. Install a matching PyTorch (2.6 or newer) and `torch_npu` pair for your hardware and Python version, then install the shared project dependencies. See the [Ascend compatibility table](https://github.com/Ascend/pytorch/blob/master/COMPATIBILITY.en.md).
