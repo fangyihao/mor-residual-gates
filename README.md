@@ -1,20 +1,14 @@
-# Mixture-of-Recursions: Learning Dynamic Recursive Depths for Adaptive Token-Level Computation (NeurIPS 2025)
+# MoR Residual Gates
 
-<a href="https://arxiv.org/abs/2507.10524"><img src="https://img.shields.io/badge/Paper-arXiv:2507.10524-Green"></a>
-<a href="https://github.com/raymin0223/mixture_of_recursions?tab=readme-ov-file#-bibtex"><img src="https://img.shields.io/badge/Paper-BibTex-yellow"></a>
+Research code for *Learning the Strength of Recursive Updates in Mixture-of-Recursions*, built on the [original MoR implementation by Bae et al.](https://github.com/raymin0223/mixture_of_recursions).
 
-**[Sangmin Bae](https://scholar.google.com/citations?hl=en&user=T5rHY14AAAAJ)<sup>1\*</sup> &nbsp; [Yujin Kim](https://scholar.google.com/citations?hl=en&user=17yTpxsAAAAJ&hl)<sup>1\*</sup> &nbsp; [Reza Bayat](https://scholar.google.com/citations?hl=en&user=58et-JMAAAAJ)<sup>2\*</sup> &nbsp; [Sungnyun Kim](https://scholar.google.com/citations?hl=en&user=DsWny60AAAAJ&hl)<sup>1</sup> &nbsp; [Jiyoun Ha](https://scholar.google.com/citations?hl=en&user=tTBHK54AAAAJ)<sup>3</sup> &nbsp; [Tal Schuster](https://scholar.google.com/citations?hl=en&user=oo8QRmIAAAAJ)<sup>4</sup> &nbsp; [Adam Fisch](https://scholar.google.com/citations?hl=en&user=LYRkQhMAAAAJ&hl)<sup>4</sup>  &nbsp; [Hrayr Harutyunyan](https://scholar.google.com/citations?hl=en&user=GaCGz8wAAAAJ)<sup>5</sup>  &nbsp; [Ziwei Ji](https://scholar.google.com/citations?hl=en&user=3l_6H5sAAAAJ)<sup>4</sup> &nbsp; [Aaron Courville](https://scholar.google.com/citations?hl=en&user=km6CP8cAAAAJ)<sup>2,6&dagger;</sup> &nbsp; [Se-Young Yun](https://scholar.google.com/citations?hl=en&user=X_IAjb8AAAAJ)<sup>1&dagger;</sup>**.  
-<sup>**1**</sup>KAIST AI &nbsp; <sup>**2**</sup>Mila &nbsp; <sup>**3**</sup>Google Cloud &nbsp;  <sup>**4**</sup>Google DeepMind &nbsp; <sup>**5**</sup>Google Research &nbsp; <sup>**6**</sup>Université de Montréal    
-\*Equal contribution. &nbsp; &dagger;Corresponding authors.
+The main study compares layer-specific and stage-shared ReZero gates at $K=3$. The short ablations compare both gate designs, two fixed schedules, and native MoR at $K=3,4,6$.
 
-<p align="left">
-<img width="700" src="asset/mor_fig1.png">
-</p>
-
+[LaTeX manuscript](paper/recursive_residual_gates.tex) · [Run the paper experiments](#compare-rezero-with-the-published-mor-result)
 
 ## Learnable ReZero-style recursive residual gates
 
-The proposed experiment continues pretraining from SmolLM-360M. Each physical decoder layer runs once on every token. The router can then select up to $K-1$ extra executions of that layer. With sequence sharing, these executions are consecutive, and every token starts the next physical layer even if it exited the previous layer early.
+The separate sequence-sharing preset continues pretraining from SmolLM-360M. Each physical decoder layer runs once on every token. The router can then select up to $K-1$ extra executions of that layer. With sequence sharing, these executions are consecutive, and every token starts the next physical layer even if it exited the previous layer early.
 
 For each selected extra execution $j$, the whole attention-plus-MLP block returns $h + c_{l,j}(F_l(h)-h)$. The first execution always returns $F_l(h)$. The proposed method learns one independent, unconstrained scalar per physical layer and extra execution. The gates start at zero and have a dedicated AdamW parameter group with zero weight decay. A selected block still executes at zero so its gate receives a gradient.
 
@@ -292,6 +286,19 @@ export NNODES=2 MASTER_ADDR=host0.example.org MASTER_PORT=29500
 export NODE_RANK=0  # use 1 on the second host
 bash scripts/run_npu.sh train 0,1,2,3,4,5,6,7 name=ascend_rezero_16npu
 ```
+
+## Original Mixture-of-Recursions paper (NeurIPS 2025)
+
+<a href="https://arxiv.org/abs/2507.10524"><img src="https://img.shields.io/badge/Paper-arXiv:2507.10524-Green"></a>
+<a href="https://github.com/raymin0223/mixture_of_recursions?tab=readme-ov-file#-bibtex"><img src="https://img.shields.io/badge/Paper-BibTex-yellow"></a>
+
+**[Sangmin Bae](https://scholar.google.com/citations?hl=en&user=T5rHY14AAAAJ)<sup>1\*</sup> &nbsp; [Yujin Kim](https://scholar.google.com/citations?hl=en&user=17yTpxsAAAAJ&hl)<sup>1\*</sup> &nbsp; [Reza Bayat](https://scholar.google.com/citations?hl=en&user=58et-JMAAAAJ)<sup>2\*</sup> &nbsp; [Sungnyun Kim](https://scholar.google.com/citations?hl=en&user=DsWny60AAAAJ&hl)<sup>1</sup> &nbsp; [Jiyoun Ha](https://scholar.google.com/citations?hl=en&user=tTBHK54AAAAJ)<sup>3</sup> &nbsp; [Tal Schuster](https://scholar.google.com/citations?hl=en&user=oo8QRmIAAAAJ)<sup>4</sup> &nbsp; [Adam Fisch](https://scholar.google.com/citations?hl=en&user=LYRkQhMAAAAJ&hl)<sup>4</sup>  &nbsp; [Hrayr Harutyunyan](https://scholar.google.com/citations?hl=en&user=GaCGz8wAAAAJ)<sup>5</sup>  &nbsp; [Ziwei Ji](https://scholar.google.com/citations?hl=en&user=3l_6H5sAAAAJ)<sup>4</sup> &nbsp; [Aaron Courville](https://scholar.google.com/citations?hl=en&user=km6CP8cAAAAJ)<sup>2,6&dagger;</sup> &nbsp; [Se-Young Yun](https://scholar.google.com/citations?hl=en&user=X_IAjb8AAAAJ)<sup>1&dagger;</sup>**.<br>
+<sup>**1**</sup>KAIST AI &nbsp; <sup>**2**</sup>Mila &nbsp; <sup>**3**</sup>Google Cloud &nbsp;  <sup>**4**</sup>Google DeepMind &nbsp; <sup>**5**</sup>Google Research &nbsp; <sup>**6**</sup>Université de Montréal<br>
+\*Equal contribution. &nbsp; &dagger;Corresponding authors.
+
+<p align="left">
+<img width="700" src="asset/mor_fig1.png">
+</p>
 
 ## 🔥 Research Motivation
 
