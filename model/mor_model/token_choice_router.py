@@ -326,24 +326,27 @@ class MoRLlamaDecoderLayer(nn.Module):
                 
         balancing_loss = None
         balancing_ratio = None
+        branch_counts = None
         router_z_loss = None
         
         if self.training and not self.cfg.mor.rand_router:
+            if self.cfg.mor.token.balancing in {"loss", "loss_free"}:
+                branch_counts = torch.bincount(top_expert_indices.reshape(-1), minlength=self.num_recursion)
+                balancing_ratio = branch_counts / (bs * seq_len)
             if self.cfg.mor.token.balancing == "loss":
                 P_i = torch.sum(router_probs, dim=(0,1)) / (bs * seq_len)
-                balancing_ratio = torch.bincount(top_expert_indices.view(-1), minlength=self.num_recursion) / (bs * seq_len)
                 f_i = self.num_recursion * balancing_ratio
                 balancing_loss = sum(P_i * f_i) / (kwargs["num_items_in_batch"] / bs / seq_len)
-                
-            elif self.cfg.mor.token.balancing == "loss_free":
-                balancing_loss = None
-                balancing_ratio = torch.bincount(top_expert_indices.view(-1), minlength=self.num_recursion) / (bs * seq_len)
                 
             if "z_loss" in self.cfg.mor and self.cfg.mor.z_loss:   
                 router_z_loss = torch.logsumexp(router_weights, dim=-1)
                 router_z_loss = torch.square(router_z_loss)
                 router_z_loss = router_z_loss.mean() / (kwargs["num_items_in_batch"] / bs / seq_len)           
             
+        observer = getattr(self, "_observe_token_choices", None)
+        if self.training and observer is not None:
+            observer(top_expert_indices, branch_counts)
+
         return MoRLayerOutputWithPast(
             hidden_state=x if self.residual_recursion else final_x,
             attention_weights=outputs[1:],

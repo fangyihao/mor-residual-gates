@@ -26,6 +26,7 @@ from model.relaxation.util import relax_weight_sharing
 from util.resume import checkpoint_step, complete_checkpoint, has_weights, latest_checkpoint, same_recipe
 from util.resume_callback import ResumeCallback
 from util.config import preprocess_config
+from util.plot_state import TrainingLog
 from util.device import select_npu
 from util.tokenizer import load_tokenizer_from_config 
 from util.trainer_pt import MoRTrainer, RecursiveTrainer
@@ -207,6 +208,7 @@ def main(cfg: DictConfig):
         trainer = MoRTrainer(model=model, args=train_args, train_dataset=train_dataset, callbacks=callbacks, cfg=cfg,)
     else:
         trainer_cls = RecursiveTrainer if residual is not None and residual.mode in LEARNED_GATE_MODES else Trainer
+        callbacks.append(TrainingLog())
         trainer = trainer_cls(model=model, args=train_args, train_dataset=train_dataset, callbacks=callbacks,)
     
     if managed_run:

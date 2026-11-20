@@ -49,7 +49,7 @@ class RouterCallback(TrainerCallback):
 
     def on_step_end(self, args, state, control, model, **kwargs):
         trainer = self.trainer
-        if trainer.track_token_layers and (control.should_save or control.should_training_stop):
+        if control.should_save or control.should_training_stop:
             # Keep the final partial interval, including at a resumable checkpoint.
             control.should_log = True
         if trainer.ratio_count:
@@ -76,10 +76,9 @@ class MoRTrainer(RecursiveTrainer):
     def __init__(self, *args, cfg, **kwargs):
         super().__init__(*args, **kwargs)
         self.cfg = cfg
-        self.plot = PlotState(self, cfg) if cfg.get("plot_states", False) else None
-        if self.plot:
-            self.add_callback(self.plot)
-        self.track_token_layers = cfg.get("track_token_layers", False) or self.plot is not None
+        self.plot = PlotState(self, cfg)
+        self.add_callback(self.plot)
+        self.track_token_layers = cfg.get("track_token_layers", False) or cfg.get("plot_states", False)
         self.metric_sums = defaultdict(float)
         self.metric_counts = defaultdict(int)
         self.ratio_sum = 0
@@ -91,8 +90,7 @@ class MoRTrainer(RecursiveTrainer):
 
     def train(self, *args, **kwargs):
         with ExitStack() as hooks:
-            if self.plot:
-                self.plot.install(hooks)
+            self.plot.install(hooks)
             if self.track_token_layers:
                 for block in self.model.modules():
                     if isinstance(block, LlamaDecoderLayer):
@@ -160,14 +158,14 @@ class MoRTrainer(RecursiveTrainer):
         if num_items_in_batch is None and model.training:
             num_items_in_batch = (inputs["labels"][..., 1:] != -100).sum().clamp_min(1)
         self.batch_token_layers = 0 if self.track_token_layers and model.training else None
-        if self.plot:
-            self.plot.capture = model.training
-            self.plot.sample_hidden = not self.plot.hidden
+        self.plot.capture = model.training
+        self.plot.sample_hidden = not self.plot.hidden
+        self.plot.token_mask = inputs.get("attention_mask")
         try:
             loss, outputs = super().compute_loss(model, inputs, return_outputs=True, num_items_in_batch=num_items_in_batch)
         finally:
-            if self.plot:
-                self.plot.capture = False
+            self.plot.capture = False
+            self.plot.token_mask = None
         lm_loss = loss.detach()
         if self.batch_token_layers is not None:
             self.interval_token_layers += self.batch_token_layers
@@ -196,14 +194,13 @@ class MoRTrainer(RecursiveTrainer):
             if mor.get("z_loss"):
                 loss = loss + mor.get("z_coeff", 0.001) * outputs.router_z_loss * world
                 self.record("router_z_loss", outputs.router_z_loss * accumulation * world)
-            if self.plot:
-                # Match the Trainer's final GA normalization in training_step.
-                scaled = self.loss_is_scaled_for_ga
-                if scaled is None:
-                    scaled = (self.model_accepts_loss_kwargs and supplied_items) or self.compute_loss_func is not None
-                divisor = 1 if scaled else accumulation
-                self.plot.lm = self.plot.lm + lm_loss / divisor
-                self.plot.aux = self.plot.aux + (loss.detach() - lm_loss) / divisor
+            # Match the Trainer's final GA normalization in training_step.
+            scaled = self.loss_is_scaled_for_ga
+            if scaled is None:
+                scaled = (self.model_accepts_loss_kwargs and supplied_items) or self.compute_loss_func is not None
+            divisor = 1 if scaled else accumulation
+            self.plot.lm = self.plot.lm + lm_loss / divisor
+            self.plot.aux = self.plot.aux + (loss.detach() - lm_loss) / divisor
         return (loss, outputs) if return_outputs else loss
 
     def log(self, logs, start_time=None):
@@ -217,8 +214,7 @@ class MoRTrainer(RecursiveTrainer):
                 work, tokens = self.accelerator.reduce(counts, reduction="sum").tolist()
                 logs.update(executed_token_layers=work, input_tokens=tokens)
                 self.interval_token_layers = self.interval_input_tokens = 0
-            if self.plot:
-                self.plot.collect(logs, self.state)
+            self.plot.collect(logs, self.state)
             self.metric_sums.clear()
             self.metric_counts.clear()
         super().log(logs, start_time)

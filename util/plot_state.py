@@ -12,18 +12,61 @@ from model.base_model.modeling_llama import LlamaDecoderLayer
 from model.recursive_residual import stage_scales
 
 
-class PlotState(TrainerCallback):
+class TrainingLog(TrainerCallback):
+    """Persist the Trainer's committed history and subsequent events on global rank zero."""
+
+    def __init__(self, identity=None, jsonl=False):
+        self.identity = dict(identity or {})
+        self.filenames = ["training.log"]
+        if jsonl:
+            self.filenames.append("training_metrics.jsonl")
+
+    def write(self, file, row, filename):
+        event = "train" if "loss" in row else "eval" if any(k.startswith("eval_") for k in row) else "trainer"
+        values = {"step": row.get("step"), "event": event, **self.identity, **row}
+        values = {k: None if isinstance(v, float) and not math.isfinite(v) else v for k, v in values.items()}
+        if filename.endswith(".jsonl"):
+            line = json.dumps(values, allow_nan=False)
+        else:
+            line = " ".join(f"{key}={json.dumps(value, allow_nan=False)}" for key, value in values.items())
+        file.write(line + "\n")
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        if state.is_world_process_zero:
+            directory = Path(args.output_dir)
+            directory.mkdir(parents=True, exist_ok=True)
+            self.identity.setdefault("run", directory.name)
+            self.identity.setdefault("seed", args.seed)
+            for filename in self.filenames:
+                path = directory / filename
+                tmp = directory / (filename + ".tmp")
+                with tmp.open("w", encoding="utf-8") as file:
+                    for row in state.log_history:
+                        self.write(file, row, filename)
+                tmp.replace(path)
+
+    def on_log(self, args, state, control, **kwargs):
+        if state.is_world_process_zero:
+            for filename in self.filenames:
+                with (Path(args.output_dir) / filename).open("a", encoding="utf-8") as file:
+                    self.write(file, state.log_history[-1], filename)
+
+
+class PlotState(TrainingLog):
     def __init__(self, trainer, cfg):
         self.trainer = trainer
         self.cfg = cfg
-        self.path = Path(trainer.args.output_dir) / "training_metrics.jsonl"
-        self.hidden_samples = int(cfg.get("plot_hidden_samples", 16))
+        detailed = cfg.get("plot_states", False)
+        self.hidden_samples = int(cfg.get("plot_hidden_samples", 16)) if detailed else 0
         if self.hidden_samples < 0:
             raise ValueError("plot_hidden_samples must be nonnegative")
         self.capture = False
         self.sample_hidden = False
         self.hidden = {}
+        self.block_names = []
         self.routed = {}
+        self.branch_counts = {}
+        self.token_mask = None
         self.writebacks = {}
         self.gate_grads = {}
         self.lm = self.aux = 0
@@ -34,9 +77,9 @@ class PlotState(TrainerCallback):
             scales = stage_scales(residual.mode, cfg.recursive.num_recursion,
                                   residual.get("lambda_r", 1.0), residual.get("zeta", 1.0))
             self.fixed = {f"epsilon/stage_{j}": scale for j, scale in enumerate(scales, 2) if scale is not None}
-        self.identity = {"run": cfg.get("name"), "method": cfg.get("paper_method") or
-                         (cfg.recursive.get("residual") or {}).get("mode", "original_mor"),
-                         "k": cfg.recursive.num_recursion, "seed": trainer.args.seed}
+        super().__init__({"run": cfg.get("name"), "method": cfg.get("paper_method") or
+                          (residual or {}).get("mode", "original_mor"), "router_type": cfg.mor.type,
+                          "k": cfg.recursive.num_recursion, "seed": trainer.args.seed}, jsonl=detailed)
 
     def observe_block(self, key, x, raw, y):
         if not (self.capture and self.sample_hidden):
@@ -46,8 +89,19 @@ class PlotState(TrainerCallback):
         index = torch.arange(n, device=x.device) * (b * s) // n
         bx, sx = index // s, index % s
         x, raw, y = (v.detach()[bx, sx].float() for v in (x, raw, y))
-        self.hidden[key] = torch.stack([x.square().mean(), y.square().mean(),
-                                        (raw - x).square().mean(), (y - x).square().mean()])
+        moments = [x.square().mean(), y.square().mean(), (raw - x).square().mean(), (y - x).square().mean()]
+        self.hidden[key] = torch.stack([m * n for m in moments] + [x.new_tensor(n)])
+
+    def observe_token_choices(self, key, choices, counts):
+        if not self.capture:
+            return
+        k = self.identity["k"]
+        if self.token_mask is not None and self.token_mask.ndim == 2:
+            counts = choices.new_zeros(k).scatter_add_(
+                0, choices.reshape(-1), self.token_mask.bool().long().reshape(-1))
+        elif counts is None:
+            counts = torch.bincount(choices.reshape(-1), minlength=k)
+        self.branch_counts[key] = self.branch_counts.get(key, 0) + counts
 
     def observe_router(self, key, module, args, out):
         if not self.capture:
@@ -72,37 +126,25 @@ class PlotState(TrainerCallback):
             self.writebacks[key] = (after - before).square().mean()
 
     def install(self, stack):
+        self.block_names.clear()
         for name, module in self.trainer.model.named_modules():
             if getattr(module, "mor_type", None) == "expert":
                 stack.enter_context(module.register_forward_hook(partial(self.observe_router, name)))
+            elif getattr(module, "mor_type", None) == "token":
+                module._observe_token_choices = partial(self.observe_token_choices, name)
+                stack.callback(delattr, module, "_observe_token_choices")
             elif self.hidden_samples and isinstance(module, LlamaDecoderLayer):
+                self.block_names.append(name)
                 module._observe_recursive_update = partial(self.observe_block, name)
                 stack.callback(delattr, module, "_observe_recursive_update")
 
     def on_train_begin(self, args, state, control, **kwargs):
+        super().on_train_begin(args, state, control, **kwargs)
         state.logging_steps = math.ceil(args.logging_steps * state.max_steps) if args.logging_steps < 1 else args.logging_steps
         self.step = state.global_step
         self.tokens = sum(r.get("input_tokens", 0) for r in state.log_history)
         self.work = sum(r.get("executed_token_layers", 0) for r in state.log_history)
         self.clock = time.monotonic()
-        if state.is_world_process_zero:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            # A crash can leave newer uncommitted or partial lines after the checkpoint.
-            tmp = self.path.with_suffix(".tmp")
-            with tmp.open("w") as f:
-                for row in state.log_history:
-                    self.write(f, row)
-            tmp.replace(self.path)
-
-    def write(self, file, row):
-        event = "train" if "loss" in row else "eval" if any(k.startswith("eval_") for k in row) else "trainer"
-        values = {k: None if isinstance(v, float) and not math.isfinite(v) else v for k, v in row.items()}
-        file.write(json.dumps({**self.identity, "event": event, **values}, allow_nan=False) + "\n")
-
-    def on_log(self, args, state, control, **kwargs):
-        if state.is_world_process_zero:
-            with self.path.open("a") as f:
-                self.write(f, state.log_history[-1])
 
     def on_pre_optimizer_step(self, args, state, control, **kwargs):
         # HF invokes this after clipping, before the optimizer clears gradients.
@@ -117,6 +159,20 @@ class PlotState(TrainerCallback):
         loss_parts = torch.stack([self.lm, self.aux]).float() / steps
         logs["lm_loss"], logs["weighted_aux_loss"] = trainer.accelerator.reduce(loss_parts, reduction="mean").tolist()
         self.lm = self.aux = 0
+        if self.branch_counts:
+            counts = torch.stack(list(self.branch_counts.values()))
+            totals = trainer.accelerator.reduce(counts, reduction="sum").tolist()
+            for key, exits in zip(self.branch_counts, totals):
+                total = sum(exits)
+                reaching = total
+                for depth, count in enumerate(exits, 1):
+                    branch = f"router/{key}/depth_{depth}"
+                    logs[f"{branch}/exit_tokens"] = count
+                    logs[f"{branch}/exit_fraction"] = count / total if total else 0.0
+                    logs[f"{branch}/reach_tokens"] = reaching
+                    logs[f"{branch}/reach_fraction"] = reaching / total if total else 0.0
+                    reaching -= count
+            self.branch_counts.clear()
         if self.routed:
             keys = list(self.routed)
             counts = torch.tensor([self.routed[key] for key in keys], device=trainer.args.device, dtype=torch.long)
@@ -129,13 +185,14 @@ class PlotState(TrainerCallback):
                 for j, (reach, deeper) in enumerate(zip(reaches, reaches[1:] + [0.0]), 1):
                     logs[f"depth/{j}/fraction"] = reach - deeper
             self.routed.clear()
-        if self.hidden:
-            keys = list(self.hidden)
-            values = torch.stack([self.hidden[key] for key in keys])
-            rms = trainer.accelerator.reduce(values, reduction="mean").sqrt().tolist()
-            for key, moments in zip(keys, rms):
-                for field, value in zip(("input_rms", "output_rms", "raw_update_rms", "update_rms"), moments):
-                    logs[f"hidden/{key}/{field}"] = value
+        if self.block_names:
+            # Different ranks may skip different blocks. Reduce in model order with zero weight for absent samples.
+            zero = torch.zeros(5, device=trainer.args.device)
+            values = torch.stack([self.hidden.get(key, zero) for key in self.block_names])
+            for key, (*moments, n) in zip(self.block_names, trainer.accelerator.reduce(values, reduction="sum").tolist()):
+                if n:
+                    for field, moment in zip(("input_rms", "output_rms", "raw_update_rms", "update_rms"), moments):
+                        logs[f"hidden/{key}/{field}"] = math.sqrt(moment / n)
             self.hidden.clear()
         if self.writebacks:
             values = torch.stack(list(self.writebacks.values()))
@@ -158,11 +215,12 @@ class PlotState(TrainerCallback):
             logs["loss_scale"] = scaler.get_scale()
         now = time.monotonic()
         seconds = now - self.clock
-        self.tokens += logs["input_tokens"]
-        self.work += logs["executed_token_layers"]
-        logs.update(interval_optimizer_steps=steps, cumulative_input_tokens=self.tokens,
-                    cumulative_executed_token_layers=self.work,
-                    interval_seconds=seconds, tokens_per_second=logs["input_tokens"] / max(seconds, 1e-9),
+        if trainer.track_token_layers:
+            self.tokens += logs["input_tokens"]
+            self.work += logs["executed_token_layers"]
+            logs.update(cumulative_input_tokens=self.tokens, cumulative_executed_token_layers=self.work,
+                        tokens_per_second=logs["input_tokens"] / max(seconds, 1e-9))
+        logs.update(interval_optimizer_steps=steps, interval_seconds=seconds,
                     gradient_accumulation=trainer.args.gradient_accumulation_steps,
                     world_size=trainer.args.world_size, per_device_batch_size=trainer._train_batch_size)
         self.step, self.clock = state.global_step, now
