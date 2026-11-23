@@ -1,0 +1,6 @@
+# @package _global_
+defaults:
+  - /250720_pretrain_smollm-360m_rec3_middle_cycle_random_lr3e-3_mor_token_softmax_bal_loss_coeff_0.1_linear_zloss_1e-5
+  - _self_
+
+name: paper_mor_${mor.type}_k${recursive.num_recursion}_${paper_method}_seed${seed}

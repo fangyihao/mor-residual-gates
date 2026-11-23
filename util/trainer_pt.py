@@ -86,6 +86,7 @@ class MoRTrainer(RecursiveTrainer):
         self.add_callback(RouterCallback(self))
         self.batch_token_layers = None
         self.interval_token_layers = 0
+        self.interval_causal_pairs = 0
         self.interval_input_tokens = 0
 
     def train(self, *args, **kwargs):
@@ -101,6 +102,7 @@ class MoRTrainer(RecursiveTrainer):
         if self.batch_token_layers is not None:
             batch, length, _ = args[0].shape
             self.batch_token_layers += batch * length
+            self.interval_causal_pairs += batch * (length * (length + 1) // 2)
 
     def _load_optimizer_and_scheduler(self, checkpoint):
         # v4 saved the auxiliary router's AdamW state in a separate file.
@@ -209,11 +211,11 @@ class MoRTrainer(RecursiveTrainer):
                 means = torch.stack([value.float() / self.metric_counts[name] for name, value in self.metric_sums.items()])
                 logs.update(zip(self.metric_sums, self.accelerator.reduce(means, reduction="mean").tolist()))
             if self.track_token_layers:
-                counts = torch.tensor([self.interval_token_layers, self.interval_input_tokens],
+                counts = torch.tensor([self.interval_token_layers, self.interval_input_tokens, self.interval_causal_pairs],
                                       dtype=torch.long, device=self.accelerator.device)
-                work, tokens = self.accelerator.reduce(counts, reduction="sum").tolist()
-                logs.update(executed_token_layers=work, input_tokens=tokens)
-                self.interval_token_layers = self.interval_input_tokens = 0
+                work, tokens, pairs = self.accelerator.reduce(counts, reduction="sum").tolist()
+                logs.update(executed_token_layers=work, input_tokens=tokens, executed_causal_pairs=pairs)
+                self.interval_token_layers = self.interval_input_tokens = self.interval_causal_pairs = 0
             self.plot.collect(logs, self.state)
             self.metric_sums.clear()
             self.metric_counts.clear()

@@ -59,7 +59,17 @@ def plan(config_name, overrides, seeds, ablation_steps=None, full_budget_control
         return plan_depth(config_name, overrides, seeds, ablation_steps, full_budget_control, ablations_only)
 
     with initialize_config_dir(config_dir=str(ROOT / "conf/pretrain"), version_base=None):
-        main_k = compose(config_name, overrides=overrides).recursive.num_recursion
+        main_config = compose(config_name, overrides=overrides)
+        main_k = main_config.recursive.num_recursion
+    # The suite also accepts the usual mor.type override. Select its complete
+    # released recipe (router losses, scores and checkpoint namespace).
+    if any(a.partition("=")[0].lstrip("+") == "mor.type" for a in overrides):
+        router = main_config.mor.type
+        selected = next((a.partition("=")[2] for a in overrides if a.startswith("paper_router=")), None)
+        if selected is not None and selected != router:
+            raise ValueError("paper_router and mor.type must select the same routing method")
+        if selected is None:
+            overrides = [f"paper_router={router}", *overrides]
     main_preset = PAPER_PRESETS.get(main_k, config_name)
     if ablation_steps is None:
         return plan_depth(main_preset, overrides, seeds, None, full_budget_control, ablations_only)
@@ -239,8 +249,9 @@ def main():
             overrides.append("auto_resume=" + str(args.auto_resume).lower())
         runs = plan(config, overrides, args.seeds, args.ablation_steps, args.full_budget_control, args.ablations_only, args.ablation_ks)
         if args.author_checkpoint:
-            from scripts.paper_comparison import RELEASED_CONFIG, recipe_changes
-            reference = OmegaConf.to_container(OmegaConf.load(ROOT / "conf/pretrain" / (RELEASED_CONFIG + ".yaml")))
+            from scripts.paper_comparison import RELEASED_CONFIGS, recipe_changes
+            released = RELEASED_CONFIGS[runs[0].config.mor.type]
+            reference = OmegaConf.to_container(OmegaConf.load(ROOT / "conf/pretrain" / (released + ".yaml")))
             changes = recipe_changes(runs[0].config, reference)
             structural = {"model", "model_config", "recursive", "mor", "kv_sharing", "relaxation", "tokenizer"} & changes.keys()
             if structural:
@@ -262,11 +273,13 @@ def main():
         parser.error(str(exc))
 
     if not args.train_only:
-        default_name = (f"residual_suite_fineweb.step-{args.ablation_steps}.json" if args.ablation_steps
-                        else "residual_suite_fineweb.json")
-        if args.paper_comparison:
-            default_name = default_name.replace("residual_suite", "paper_mor")
-        output = ROOT / (args.output_file or default_name)
+        prefix = "paper_mor" if args.paper_comparison else "residual_suite"
+        if runs[0].config.mor.type == "token":
+            prefix += "_token"
+        base_output = ROOT / (args.output_file or f"{prefix}_fineweb.json")
+        output = base_output
+        if args.ablation_steps and not args.output_file:
+            output = base_output.with_name(f"{base_output.stem}.step-{args.ablation_steps}{base_output.suffix}")
         if output.is_dir():
             parser.error(f"--output-file points to a directory: {output}")
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -294,8 +307,7 @@ def main():
         full_target = training_target(long_runs[0].config)
         destination = output
         if args.ablation_steps:
-            base = ROOT / (args.output_file or ("paper_mor_fineweb.json" if args.paper_comparison else "residual_suite_fineweb.json"))
-            destination = base.with_name(f"{base.stem}.full-step-{full_target}{base.suffix}")
+            destination = base_output.with_name(f"{base_output.stem}.full-step-{full_target}{base_output.suffix}")
         panels.append((full_target, long_runs, destination, args.paper_comparison))
     evaluated = False
     for step, group, destination, paper_final in panels:

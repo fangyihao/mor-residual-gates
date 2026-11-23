@@ -16,7 +16,7 @@ def test_default_matrix_and_names():
     runs = plan("recursive_residual", [], None)
     assert [(r.seed, r.mode) for r in runs] == [(seed, mode) for seed in DEFAULT_SEEDS for mode in MODES]
     for r in runs:
-        assert r.directory == f"mor_expert_sequence_k8_{r.mode}_seed{r.seed}"
+        assert r.directory == f"mor_token_sequence_k8_{r.mode}_seed{r.seed}"
         assert {"recursive.num_recursion=8", "gradient_checkpointing=true", "track_token_layers=true"} <= set(r.overrides)
 
 

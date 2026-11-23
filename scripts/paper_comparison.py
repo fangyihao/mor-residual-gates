@@ -9,15 +9,21 @@ from omegaconf import OmegaConf
 from scripts.paper_table3 import FLOP_CONVENTION, METRICS, forward_work, write_table3
 from util.resume import weight_files
 
-RELEASED_CONFIG = "250720_pretrain_smollm-360m_rec3_middle_cycle_random_lr3e-3_mor_expert_linear_alpha_0.1_sigmoid_aux_loss_0.001"
-PUBLISHED = {
-    "source": "Bae et al., NeurIPS 2025, Table 3, Expert / Cache / M-Cyc / 3, fixed FLOPs",
+RELEASED_CONFIGS = {
+    "expert": "250720_pretrain_smollm-360m_rec3_middle_cycle_random_lr3e-3_mor_expert_linear_alpha_0.1_sigmoid_aux_loss_0.001",
+    "token": "250720_pretrain_smollm-360m_rec3_middle_cycle_random_lr3e-3_mor_token_softmax_bal_loss_coeff_0.1_linear_zloss_1e-5",
+}
+PUBLISHED_METRICS = {
+    "expert": {"fineweb_nll": 2.7925, "LD": 33.1, "HS": 37.9, "PQ": 66.9, "WG": 52.1, "ARC": 38.3, "MMLU": 27.4, "Avg": 42.6},
+    "token": {"fineweb_nll": 2.9163, "LD": 27.6, "HS": 34.1, "PQ": 63.8, "WG": 50.6, "ARC": 37.4, "MMLU": 26.8, "Avg": 40.0},
+}
+PUBLISHED = {router: {
+    "source": f"Bae et al., NeurIPS 2025, Table 3, {router.title()} / Cache / M-Cyc / 3, fixed FLOPs",
     "url": "https://papers.nips.cc/paper_files/paper/2025/file/8b08bbf8b420faa6eeb4020720582ec7-Paper-Conference.pdf",
     "non_embedding_parameters_rounded": 118_000_000, "training_tokens_rounded": 30_000_000_000,
     "reported_training_flops": 16.5e18,
-    "metrics": {"fineweb_nll": 2.7925, "LD": 33.1, "HS": 37.9, "PQ": 66.9, "WG": 52.1,
-                "ARC": 38.3, "MMLU": 27.4, "Avg": 42.6},
-}
+    "metrics": metrics,
+} for router, metrics in PUBLISHED_METRICS.items()}
 
 # These upstream fields define the scientific recipe. Device, data parallelism and
 # checkpoint settings are recorded in the saved configs, independently of these fields.
@@ -101,7 +107,8 @@ def write_table(path, result):
             values.append(label)
         lines.append("| " + " | ".join([source, method, str(seeds), tokens, flops, *values]) + " |")
 
-    add_row("Bae et al., Table 3", "MoR", "—", "30B (reported)", "16.5 (reported)", PUBLISHED["metrics"])
+    published = result["published_reference"]
+    add_row("Bae et al., Table 3", f"MoR ({result['router_type']})", "—", "30B (reported)", "16.5 (reported)", published["metrics"])
     if "authors_checkpoint_rescored" in result:
         add_row("Supplied MoR checkpoint scored locally", "MoR", "—", "—", "—", result["authors_checkpoint_rescored"]["metrics"])
     for mode, metrics in result["local_summary"].items():
@@ -122,12 +129,14 @@ def write_table(path, result):
         shots = sorted({n for b in result["benchmark_protocol"].values() for n in b["n_shot"].values() if isinstance(n, int)})
         lines += ["", f"Local harness shot counts observed across tasks: {shots}. Per-task counts are in the JSON. "
                   "The published paper does not enumerate the counts for each task."]
-    lines += ["", "[Published reference and evaluation details](" + PUBLISHED["url"] + ")"]
+    lines += ["", "[Published reference and evaluation details](" + published["url"] + ")"]
     path.write_text("\n".join(lines) + "\n")
 
 
 def write_report(root, runs, output, downstream, author_checkpoint=None):
-    reference = OmegaConf.to_container(OmegaConf.load(root / "conf/pretrain" / (RELEASED_CONFIG + ".yaml")))
+    router = runs[0].config.mor.type
+    released = RELEASED_CONFIGS[router]
+    reference = OmegaConf.to_container(OmegaConf.load(root / "conf/pretrain" / (released + ".yaml")))
     target_tokens = reference["num_train_steps"] * reference["total_batch_size"] * reference["max_length"]
     losses = json.loads(output.read_text())
     data = json.loads(output.with_suffix(".data.json").read_text())
@@ -145,18 +154,20 @@ def write_report(root, runs, output, downstream, author_checkpoint=None):
         changes = recipe_changes(saved, reference)
         tokens = total("input_tokens")
         token_layers = total("executed_token_layers")
+        causal_pairs = total("executed_causal_pairs")
         model_config = run.weights / "config.json"
-        work = (forward_work(json.loads(model_config.read_text()), saved.max_length, tokens, token_layers)
+        work = (forward_work(json.loads(model_config.read_text()), saved.max_length, tokens, token_layers,
+                             causal_pairs)
                 if model_config.is_file() and not saved.relaxation.enable else None)
         rows.append({"run": run.directory, "method": run.mode, "seed": run.seed, "step": state["global_step"],
                      "weights": str(run.weights.relative_to(directory)), "input_tokens": tokens,
-                     "executed_token_layers": token_layers, "forward_work": work,
+                     "executed_token_layers": token_layers, "executed_causal_pairs": causal_pairs, "forward_work": work,
                      "parameters": json.loads(count_path.read_text()) if count_path.is_file() else None,
                      "execution": {k: saved.get(k) for k in ("attn_implementation", "gradient_checkpointing",
                                                               "per_device_train_batch_size", "precision")},
                      "recipe_changes": changes, "released_token_budget_reached": tokens == target_tokens,
                      "metrics": {"fineweb_nll": losses[run.directory], **downstream_result.get("metrics", {})}})
-    result = {"published_reference": PUBLISHED, "released_config": RELEASED_CONFIG,
+    result = {"router_type": router, "published_reference": PUBLISHED[router], "released_config": released,
               "released_recipe_input_tokens": target_tokens, "evaluation_data": data,
               "benchmark_protocol": {k: {f: v for f, v in result.items() if f != "metrics"}
                                      for k, result in downstream.items()},
@@ -170,7 +181,8 @@ def write_report(root, runs, output, downstream, author_checkpoint=None):
     path = output.with_suffix(".paper.json")
     path.write_text(json.dumps(result, indent=2, allow_nan=False) + "\n")
     write_table(path.with_suffix(".md"), result)
-    print(f"Published Table 3 MoR reference: NLL 2.7925, six-task average 42.6%. Local comparisons: {path}")
+    metrics = PUBLISHED[router]["metrics"]
+    print(f"Published Table 3 {router}-choice MoR: NLL {metrics['fineweb_nll']}, average {metrics['Avg']}%. Local comparisons: {path}")
     for label, pair in result["paired_local_differences"].items():
         nll = pair["summary"]["fineweb_nll"]
         print(f"{label}  paired mean NLL difference={nll['mean']:+.7f}  seeds={nll['n']}")

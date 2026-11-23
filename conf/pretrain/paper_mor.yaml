@@ -1,5 +1,5 @@
-# NeurIPS 2025 Table 3, SmolLM-360M, K=3, fixed-FLOPs row.
+# SmolLM-360M Table 3, K=3. Select the released router recipe with paper_router.
 defaults:
-  - 250720_pretrain_smollm-360m_rec3_middle_cycle_random_lr3e-3_mor_expert_linear_alpha_0.1_sigmoid_aux_loss_0.001
+  - paper_router: token
   - paper_mor_settings
   - _self_

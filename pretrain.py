@@ -34,7 +34,7 @@ from util.callback import FixedStoppingCallback, EvalCallback, PeftSaveCallback,
 from util.misc import print_trainable_parameters, get_latest_checkpoint_path, print_rank_zero, get_launcher_type; print_rank_zero()
 
 
-@hydra.main(config_path="conf/pretrain", config_name="yymmdd_pretrain")
+@hydra.main(config_path="conf/pretrain", config_name="recursive_residual")
 def main(cfg: DictConfig):
     npu_device = select_npu()
     residual = cfg.recursive.get("residual")

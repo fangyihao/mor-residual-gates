@@ -62,7 +62,7 @@ relaxation:
     len: 16
 mor:
   enable: true
-  type: expert
+  type: token
   capacity: null
   rand_router: false
   router_type: linear

@@ -322,6 +322,7 @@ def test_executed_token_layers_per_training_interval(tmp_path, checkpointing):
         assert row["input_tokens"] == examples * 6
         # Two middle layers see 6, 4 and 2 tokens each. Both bookends see all 6.
         assert row["executed_token_layers"] == examples * (2 * (6 + 4 + 2) + 2 * 6)
+        assert row["executed_causal_pairs"] == examples * (2 * (21 + 10 + 3) + 2 * 21)
 
         assert row["loss"] == pytest.approx(row["lm_loss"] + row["weighted_aux_loss"], abs=1e-4)
         assert [row[f"depth/{j}/fraction"] for j in (1, 2, 3)] == pytest.approx([1/3] * 3)
@@ -457,11 +458,12 @@ def test_checkpoint_formats_and_shards(tmp_path, legacy):
 
 
 @pytest.mark.parametrize("mode", [None, "rezero", "rezero_stage"])
-def test_table3_forward_flops_against_executed_module_shapes(mode):
+@pytest.mark.parametrize("router", ["expert", "token"])
+def test_table3_forward_flops_against_executed_module_shapes(mode, router):
     from contextlib import ExitStack
     from scripts.paper_table3 import forward_work
 
-    model, _ = tiny_model(mode)
+    model, _ = tiny_model(mode, router=router)
     batch, length = 2, 11
     counts = Counter()
 
@@ -473,6 +475,7 @@ def test_table3_forward_flops_against_executed_module_shapes(mode):
             b, s, _ = x.shape
             counts["token_layers"] += b * s
             pairs = s * (s + 1) // 2
+            counts["pairs"] += b * pairs
             counts["attention"] += b * pairs * 4 * module.self_attn.q_proj.out_features
 
     with ExitStack() as hooks, torch.no_grad():
@@ -481,8 +484,11 @@ def test_table3_forward_flops_against_executed_module_shapes(mode):
                 hooks.enter_context(module.register_forward_pre_hook(count))
         model.eval()(input_ids=torch.arange(length).repeat(batch, 1), use_cache=False)
     cfg = model.config.to_dict()
-    work = forward_work(cfg, length, batch * length, counts["token_layers"])
+    work = forward_work(cfg, length, batch * length, counts["token_layers"], counts["pairs"])
     assert work["total"] == counts["matrix"] + counts["attention"]
     assert work["components"]["causal_attention"] == counts["attention"]
-    assert work["tokens_per_stage"] == [11, 7, 3]
+    if router == "expert":
+        assert work["tokens_per_stage"] == [11, 7, 3]
+    else:
+        assert forward_work(cfg, length, batch * length, counts["token_layers"]) is None
     assert forward_work(cfg, length, batch * length, counts["token_layers"] + 1) is None

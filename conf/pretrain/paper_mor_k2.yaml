@@ -1,5 +1,11 @@
-# NeurIPS 2025 Table 3, SmolLM-360M, K=2, fixed-FLOPs row.
+# Reuse the released K=2 geometry and schedule with the selected router.
 defaults:
-  - 250720_pretrain_smollm-360m_rec2_middle_cycle_random_lr3e-3_mor_expert_linear_alpha_0.1_sigmoid_aux_loss_0.001
-  - paper_mor_settings
+  - paper_mor
   - _self_
+
+recursive:
+  num_recursion: 2
+num_train_steps: 12619
+stop_steps: 12619
+lr_scheduler_kwargs:
+  num_decay_steps: 2524

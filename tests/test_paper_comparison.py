@@ -8,25 +8,33 @@ from omegaconf import OmegaConf
 import pytest
 
 from scripts.paper_benchmarks import TASKS, shot_overrides, table_metrics, task_specs
-from scripts.paper_comparison import PUBLISHED, RELEASED_CONFIG, paired_results, recipe_changes, write_report
+from scripts.paper_comparison import PUBLISHED, RELEASED_CONFIGS, paired_results, recipe_changes, write_report
 from scripts.run_residual_suite import PAPER_METHODS, ROOT, plan, training_target, write_ablation_csv
 
 
-def test_paper_recipes_and_control_budgets():
+@pytest.mark.parametrize("router", ["token", "expert"])
+def test_paper_recipes_and_control_budgets(router):
     methods = (*PAPER_METHODS, "uniform", "power", "original_mor")
-    runs = plan("paper_mor", [], [1234], 512)
+    runs = plan("paper_mor", [] if router == "token" else ["mor.type=expert"], [1234], 512)
     assert {(r.config.recursive.num_recursion, r.mode) for r in runs} == {
         (k, method) for k in (3, 4, 6) for method in methods}
     assert len(runs) == 15
     for run in runs:
         cfg = run.config
         k = cfg.recursive.num_recursion
-        released = RELEASED_CONFIG if k in (3, 6) else RELEASED_CONFIG.replace("_rec3_", "_rec4_")
+        released = RELEASED_CONFIGS[router]
         reference = OmegaConf.to_container(OmegaConf.load(ROOT / "conf/pretrain" / (released + ".yaml")))
         with initialize_config_dir(config_dir=str(ROOT / "conf/pretrain"), version_base=None):
             assert compose(run.preset, overrides=run.overrides) == cfg
         assert cfg.seed == 1234 and cfg.paper_method == run.mode
-        assert cfg.name == f"paper_mor_k{k}_{run.mode}_seed1234"
+        prefix = "paper_mor_token" if router == "token" else "paper_mor"
+        assert cfg.name == f"{prefix}_k{k}_{run.mode}_seed1234"
+        assert cfg.mor.type == router
+        if k == 4:
+            geometry_file = RELEASED_CONFIGS["expert"].replace("_rec3_", "_rec4_")
+            geometry = OmegaConf.load(ROOT / "conf/pretrain" / (geometry_file + ".yaml"))
+            for field in ("recursive", "model_config", "num_train_steps", "lr_scheduler_kwargs"):
+                reference[field] = geometry[field]
         if k == 6:
             # K=6 inherits every scientific setting from K=3 except the depth.
             reference["recursive"]["num_recursion"] = 6
@@ -60,8 +68,13 @@ def test_select_ablation_depths_and_pair_csv(tmp_path):
         assert [r["nll_minus_native"] for r in csv.DictReader(f)] == ["-0.5", "0", "", ""]
 
 
+def test_conflicting_paper_router_overrides():
+    with pytest.raises(ValueError, match="must select the same routing method"):
+        plan("paper_mor", ["paper_router=expert", "mor.type=token"], [1234])
+
+
 def test_existing_k2_ablations_remain_addressable():
-    runs = plan("paper_mor", [], [1234], 256, ablations_only=True, ablation_ks=[2])
+    runs = plan("paper_mor", ["paper_router=expert"], [1234], 256, ablations_only=True, ablation_ks=[2])
     assert len(runs) == 5
     assert all(r.preset == "paper_mor_k2" and r.directory == f"paper_mor_k2_{r.mode}_seed1234" for r in runs)
 
@@ -106,7 +119,7 @@ def test_report_keeps_historical_and_paired_estimates_distinct(tmp_path):
     write_report(tmp_path, runs, output, {}, weights)
     report = json.loads(output.with_suffix(".paper.json").read_text())
     assert report["released_recipe_input_tokens"] == 29_697_769_472
-    assert report["published_reference"]["metrics"] == PUBLISHED["metrics"]
+    assert report["published_reference"]["metrics"] == PUBLISHED["token"]["metrics"]
     assert report["authors_checkpoint_rescored"]["weight_sha256"]["model.safetensors"] == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
     assert report["authors_checkpoint_rescored"]["metrics"] == {"fineweb_nll": 2.9}
     assert all(not row["released_token_budget_reached"] for row in report["local_runs"])
@@ -151,7 +164,8 @@ def test_fewshot_override_reaches_every_mmlu_continuation_subject(monkeypatch):
     assert list(subjects(tree)) == [1] * 57
 
 
-def test_table3_latex_emits_only_paired_full_budget_rows(tmp_path):
+@pytest.mark.parametrize("router", ["token", "expert"])
+def test_table3_latex_emits_only_paired_full_budget_rows(tmp_path, router):
     from scripts.paper_comparison import method_summaries
     from scripts.paper_table3 import LABELS, METRICS, write_table3
 
@@ -161,17 +175,21 @@ def test_table3_latex_emits_only_paired_full_budget_rows(tmp_path):
              "parameters": {"non_embedding": 118_000_020}, "forward_work": {"total": 17_700_000_000_000_000_000},
              "metrics": {k: (2.71 if k == "fineweb_nll" else 50) + 0.2 * seed for k in METRICS}}
             for method in LABELS for seed in (1, 2)]
-    report = {"local_runs": rows, "local_summary": method_summaries(rows),
+    report = {"router_type": router, "local_runs": rows, "local_summary": method_summaries(rows),
               "evaluation_data": {"local": {"packed_sequences": 500}},
               "benchmark_protocol": {"local": {"n_shot": {"test": 0}}}}
     path = tmp_path / "table3-rows.tex"
+    if router == "token":
+        rows[-1]["executed_token_layers"] += 10
+        rows[-1]["forward_work"]["total"] += 10**17
     write_table3(path, report)
     body = [line for line in path.read_text().splitlines() if not line.startswith("%")]
     assert len(body) == 2
     for row, label in zip(body, LABELS.values(), strict=True):
         assert row.endswith(r"\\")
         fields = row[:-2].strip().split(" & ")
-        assert fields == [label, "Expert", "Cache", "M-Cyc", "3", "118M", "17.7$^{*}$", "29.70B", "3.0100",
+        display_flops = "17.8" if router == "token" and label == LABELS["rezero_stage"] else "17.7"
+        assert fields == [label, router.title(), "Cache", "M-Cyc", "3", "118M", display_flops + "$^{*}$", "29.70B", "3.0100",
                           *(["50.3"] * 7)]
     rows[-1]["metrics"].pop("HS")
     assert "incomplete" in write_table3(path, report)

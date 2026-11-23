@@ -64,7 +64,7 @@ relaxation:
 
 mor:
   enable: false
-  type: expert  # expert, token
+  type: token  # expert, token
   capacity: null
   rand_router: false  # whether to use random router
   router_type: linear  # linear, mlp, wide_mlp

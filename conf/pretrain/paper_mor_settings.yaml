@@ -1,7 +1,7 @@
-name: paper_mor_k${recursive.num_recursion}_${paper_method}_seed${seed}
 paper_method: rezero
 seed: 1234
 auto_resume: true
+resume_step: null
 wandb: false
 wandb_run_id: null
 wandb_entity: null
