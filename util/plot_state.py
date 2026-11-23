@@ -15,21 +15,16 @@ from model.recursive_residual import stage_scales
 class TrainingLog(TrainerCallback):
     """Persist the Trainer's committed history and subsequent events on global rank zero."""
 
-    def __init__(self, identity=None, jsonl=False):
-        self.identity = dict(identity or {})
-        self.filenames = ["training.log"]
-        if jsonl:
-            self.filenames.append("training_metrics.jsonl")
+    filename = "training_metrics.jsonl"
 
-    def write(self, file, row, filename):
+    def __init__(self, identity=None):
+        self.identity = dict(identity or {})
+
+    def write(self, file, row):
         event = "train" if "loss" in row else "eval" if any(k.startswith("eval_") for k in row) else "trainer"
         values = {"step": row.get("step"), "event": event, **self.identity, **row}
         values = {k: None if isinstance(v, float) and not math.isfinite(v) else v for k, v in values.items()}
-        if filename.endswith(".jsonl"):
-            line = json.dumps(values, allow_nan=False)
-        else:
-            line = " ".join(f"{key}={json.dumps(value, allow_nan=False)}" for key, value in values.items())
-        file.write(line + "\n")
+        file.write(json.dumps(values, allow_nan=False) + "\n")
 
     def on_train_begin(self, args, state, control, **kwargs):
         if state.is_world_process_zero:
@@ -37,19 +32,17 @@ class TrainingLog(TrainerCallback):
             directory.mkdir(parents=True, exist_ok=True)
             self.identity.setdefault("run", directory.name)
             self.identity.setdefault("seed", args.seed)
-            for filename in self.filenames:
-                path = directory / filename
-                tmp = directory / (filename + ".tmp")
-                with tmp.open("w", encoding="utf-8") as file:
-                    for row in state.log_history:
-                        self.write(file, row, filename)
-                tmp.replace(path)
+            path = directory / self.filename
+            tmp = path.with_suffix(".jsonl.tmp")
+            with tmp.open("w", encoding="utf-8") as file:
+                for row in state.log_history:
+                    self.write(file, row)
+            tmp.replace(path)
 
     def on_log(self, args, state, control, **kwargs):
         if state.is_world_process_zero:
-            for filename in self.filenames:
-                with (Path(args.output_dir) / filename).open("a", encoding="utf-8") as file:
-                    self.write(file, state.log_history[-1], filename)
+            with (Path(args.output_dir) / self.filename).open("a", encoding="utf-8") as file:
+                self.write(file, state.log_history[-1])
 
 
 class PlotState(TrainingLog):
@@ -79,7 +72,7 @@ class PlotState(TrainingLog):
             self.fixed = {f"epsilon/stage_{j}": scale for j, scale in enumerate(scales, 2) if scale is not None}
         super().__init__({"run": cfg.get("name"), "method": cfg.get("paper_method") or
                           (residual or {}).get("mode", "original_mor"), "router_type": cfg.mor.type,
-                          "k": cfg.recursive.num_recursion, "seed": trainer.args.seed}, jsonl=detailed)
+                          "k": cfg.recursive.num_recursion, "seed": trainer.args.seed})
 
     def observe_block(self, key, x, raw, y):
         if not (self.capture and self.sample_hidden):

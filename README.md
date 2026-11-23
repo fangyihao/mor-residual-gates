@@ -117,10 +117,10 @@ The default output `paper_mor_fineweb.paper.md` contains the reported MoR row an
 
 #### Plot training and recursion dynamics
 
-Every pretraining run writes `results/pretrain/<run>/training.log` on global rank zero. Each line contains one Trainer event as `key=value` fields, beginning with the optimizer step and event type. Paper runs also write the same records to `training_metrics.jsonl` for plotting. To follow the layer-specific main run for seed 1234:
+Every pretraining run writes `results/pretrain/<run>/training_metrics.jsonl` on global rank zero. Each line is one JSON object containing the optimizer step, event type, and recorded metrics. To follow the layer-specific main run for seed 1234, run
 
 ```bash
-tail -f results/pretrain/paper_mor_k3_rezero_seed1234/training.log
+tail -f results/pretrain/paper_mor_k3_rezero_seed1234/training_metrics.jsonl
 ```
 
 For routed paper runs, training records include optimizer step, seed, method, $K$, total loss, LM loss, weighted auxiliary loss, global gradient norm, optimizer-group learning rates and weight decay, and the mixed-precision loss scale when used. Token counts, executed token-layers, throughput, global worker count, per-device batch size and accumulation are recorded for each interval. Use `cumulative_input_tokens` to align runs by data exposure.
@@ -129,7 +129,7 @@ For token-choice runs, each routing layer records all $K$ possible depths. In `r
 
 The paper comparison uses expert-choice routing. Expert-router records include per-stage selected-token counts, reach fractions, sampling losses and accuracies where defined. For Middle-Cycle, `depth/<j>/fraction` is the fraction of tokens that stopped at exactly $j$ executions. Each independent learnable scalar has a signed `gate/<parameter>` and a `gate_grad/<parameter>` when the optimizer exposes its clipped gradient. Fixed schedules record `epsilon/stage_<j>`. Per-block `hidden/<module>/input_rms`, `output_rms`, `raw_update_rms` and `update_rms` measure the block input, output, raw repeated-block change and applied change. These RMS measurements sample up to 16 evenly spaced active positions on the first microbatch of each interval per worker. For native MoR the block-output sample precedes router weighting. For expert-choice runs, `router/<module>/writeback_rms` measures the actual stage-level change at sampled selected token positions.
 
-The paper presets log every ten optimizer steps. The separate pretrained `recursive_residual` preset also accepts `plot_states=true`. Pass `logging_steps=1` for every update, `plot_hidden_samples=0` to skip activation sampling, or `plot_states=false` to skip the JSONL and sampled activations while keeping the text log and routing counts. Checkpoint and stop steps also flush interval counters. On resume, the trainer rebuilds the logs from the restored checkpoint history and appends subsequent events. Older checkpoints contribute only the fields they recorded. The full model, optimizer, scheduler, available scaler, per-rank RNG and dataset continuation state are saved by the checkpoint machinery. Earlier checkpoints keep their original metric history.
+The paper presets log every ten optimizer steps. The separate pretrained `recursive_residual` preset also accepts `plot_states=true`. Pass `logging_steps=1` for every update or `plot_hidden_samples=0` to skip activation sampling. With `plot_states=false`, routed runs still write loss and routing counts to the JSONL. Checkpoint and stop steps also flush interval counters. On resume, the trainer rebuilds the JSONL from the restored checkpoint history and appends subsequent events. Older checkpoints contribute only the fields they recorded. The full model, optimizer, scheduler, available scaler, per-rank RNG and dataset continuation state are saved by the checkpoint machinery. Earlier checkpoints keep their original metric history.
 
 ```python
 import pandas as pd

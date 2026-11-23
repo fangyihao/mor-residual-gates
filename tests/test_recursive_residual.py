@@ -339,19 +339,13 @@ def test_executed_token_layers_per_training_interval(tmp_path, checkpointing):
     def records():
         return [json.loads(line) for line in path.read_text().splitlines()]
     original = records()
-    text_log = tmp_path / "training.log"
-    original_text = text_log.read_text()
-    for line, record in zip(original_text.splitlines(), original, strict=True):
-        assert line == " ".join(f"{k}={json.dumps(v)}" for k, v in record.items())
     assert [r["step"] for r in original if r["event"] == "train"] == [2, 3]
     assert all(r["k"] == 3 and r["method"] == "rezero_stage" for r in original)
     with path.open("a") as f:
         f.write('{"partial":')
-    with text_log.open("a") as f:
-        f.write("step=99 loss=")
     trainer.plot.on_train_begin(args, trainer.state, trainer.control)
     assert records() == original
-    assert text_log.read_text() == original_text
+    assert not (tmp_path / "training.log").exists()
 
 
 @pytest.mark.parametrize("detailed", [True, False])
@@ -369,10 +363,11 @@ def test_token_choice_log_per_layer(tmp_path, detailed):
     )
     trainer = MoRTrainer(model=model, cfg=cfg, args=args, train_dataset=[example] * 8)
     trainer.train()
-    row, = [entry for entry in trainer.state.log_history if "loss" in entry]
-    line = (tmp_path / "training.log").read_text().splitlines()[0]
-    assert line.startswith("step=2 ")
-    assert (tmp_path / "training_metrics.jsonl").exists() == detailed
+    records = [json.loads(line) for line in (tmp_path / "training_metrics.jsonl").read_text().splitlines()]
+    row, = [entry for entry in records if entry["event"] == "train"]
+    assert row["step"] == 2
+    assert "loss" in row
+    assert not (tmp_path / "training.log").exists()
     for layer, exits in enumerate(([0, 0, 32], [24, 4, 4])):
         for j, count in enumerate(exits, 1):
             prefix = f"router/model.layers.{layer}/depth_{j}"
@@ -380,7 +375,6 @@ def test_token_choice_log_per_layer(tmp_path, detailed):
             assert row[f"{prefix}/exit_fraction"] == count / 32
             assert row[f"{prefix}/reach_tokens"] == sum(exits[j - 1:])
             assert row[f"{prefix}/reach_fraction"] == sum(exits[j - 1:]) / 32
-            assert f"{prefix}/exit_tokens={count} " in line
 
 @pytest.mark.parametrize("router", ["expert", "token"])
 @pytest.mark.parametrize("sharing", ["sequence", "middle_sequence", "cycle", "middle_cycle"])
