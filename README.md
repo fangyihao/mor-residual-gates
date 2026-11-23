@@ -1,6 +1,6 @@
 # MoR Residual Gates
 
-Research code for *Learning the Strength of Recursive Updates in Mixture-of-Recursions*, built on the [original MoR implementation by Bae et al.](https://github.com/raymin0223/mixture_of_recursions).
+Research code for *Learning the Strength of Recursive Updates in Token-Choice Mixture-of-Recursions*, built on the [original MoR implementation by Bae et al.](https://github.com/raymin0223/mixture_of_recursions).
 
 Token-choice routing is the default for the main study and all ablations. The main study compares layer-specific and stage-shared ReZero gates at $K=3$. The short ablations compare both gate designs, two fixed schedules, and native MoR at $K=3,4,6$.
 
